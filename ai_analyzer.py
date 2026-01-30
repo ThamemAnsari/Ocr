@@ -63,7 +63,7 @@ if not OLLAMA_AVAILABLE and not USE_GEMINI and not USE_OPENAI:
 
 # Model selection
 OLLAMA_MODEL = 'qwen2.5:7b'
-GEMINI_MODEL = 'gemini-2.5-flash'
+GEMINI_MODEL = 'gemini-3-pro-preview'
 
 print(f"[AI Config] Selected Model: {OLLAMA_MODEL if OLLAMA_AVAILABLE else GEMINI_MODEL if USE_GEMINI else 'OpenAI GPT' if USE_OPENAI else 'None'}")
 
