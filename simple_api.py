@@ -1,23 +1,20 @@
 """
-OCR API - OPTIMIZED STREAMING VERSION
-✅ No pre-download wait time
-✅ Real-time processing with parallel execution
-✅ Smart caching and deduplication
-✅ 3x faster than previous version
+Simple OCR API - COMPLETE VERSION with Gemini Vision (NEW API)
+✅ Gemini Vision only (no macOCR dependency)
+✅ Works on Linux/Render
+✅ PDF support with proper conversion
 """
 
 from fastapi import FastAPI, File, UploadFile, Form
-from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from typing import Optional, List, Dict, Any
-from functools import wraps
-import time
+from typing import Optional, List
+from zoho_bulk_api import ZohoBulkAPI
 import tempfile 
 import os
 import requests
 import json
-import httpx
 from dotenv import load_dotenv
 from ai_analyzer import (
     analyze_bank_gemini_vision,
@@ -30,150 +27,11 @@ from PIL import Image
 import uuid
 from datetime import datetime
 import time
-import threading
-import math
 from database import log_processing, get_usage_stats, get_all_logs, delete_log
-from supabase import create_client, Client
 
 load_dotenv()
 
-# ============================================================
-# SUPABASE INITIALIZATION
-# ============================================================
-
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-SUPABASE_BUCKET = "ocr-images"
-
-
-# Initialize Supabase (connection pooling handled by retry decorator)
-supabase: Client = create_client(
-    SUPABASE_URL,
-    SUPABASE_KEY
-)
-
-print("[DATABASE] ✓ Connected to Supabase")
-
-# ============================================================
-# ZOHO MULTI-TOKEN CONFIGURATION
-# ============================================================
-
-ZOHO_TOKENS = [
-    # READ TOKENS (5)
-    {
-        "name": "Token1_Read",
-        "client_id": os.getenv("ZOHO_CLIENT_ID_1"),
-        "client_secret": os.getenv("ZOHO_CLIENT_SECRET_1"),
-        "refresh_token": os.getenv("ZOHO_REFRESH_TOKEN_1"),
-        "scope": "read",
-        "request_count": 0,
-        "error_count": 0,
-        "last_used": 0,
-        "status": "active"
-    },
-    {
-        "name": "Token2_Read",
-        "client_id": os.getenv("ZOHO_CLIENT_ID_2"),
-        "client_secret": os.getenv("ZOHO_CLIENT_SECRET_2"),
-        "refresh_token": os.getenv("ZOHO_REFRESH_TOKEN_2"),
-        "scope": "read",
-        "request_count": 0,
-        "error_count": 0,
-        "last_used": 0,
-        "status": "active"
-    },
-    {
-        "name": "Token6_Read",
-        "client_id": os.getenv("ZOHO_CLIENT_ID_6"),
-        "client_secret": os.getenv("ZOHO_CLIENT_SECRET_6"),
-        "refresh_token": os.getenv("ZOHO_REFRESH_TOKEN_6"),
-        "scope": "read",
-        "request_count": 0,
-        "error_count": 0,
-        "last_used": 0,
-        "status": "active"
-    },
-    {
-        "name": "Token7_Read",
-        "client_id": os.getenv("ZOHO_CLIENT_ID_7"),
-        "client_secret": os.getenv("ZOHO_CLIENT_SECRET_7"),
-        "refresh_token": os.getenv("ZOHO_REFRESH_TOKEN_7"),
-        "scope": "read",
-        "request_count": 0,
-        "error_count": 0,
-        "last_used": 0,
-        "status": "active"
-    },
-    {
-        "name": "Token8_Read",
-        "client_id": os.getenv("ZOHO_CLIENT_ID_8"),
-        "client_secret": os.getenv("ZOHO_CLIENT_SECRET_8"),
-        "refresh_token": os.getenv("ZOHO_REFRESH_TOKEN_8"),
-        "scope": "read",
-        "request_count": 0,
-        "error_count": 0,
-        "last_used": 0,
-        "status": "active"
-    },
-    # CREATE TOKENS (3)
-    {
-        "name": "Token3_Create",
-        "client_id": os.getenv("ZOHO_CLIENT_ID_3"),
-        "client_secret": os.getenv("ZOHO_CLIENT_SECRET_3"),
-        "refresh_token": os.getenv("ZOHO_REFRESH_TOKEN_3"),
-        "scope": "create",
-        "request_count": 0,
-        "error_count": 0,
-        "last_used": 0,
-        "status": "active"
-    },
-    {
-        "name": "Token4_Create",
-        "client_id": os.getenv("ZOHO_CLIENT_ID_4"),
-        "client_secret": os.getenv("ZOHO_CLIENT_SECRET_4"),
-        "refresh_token": os.getenv("ZOHO_REFRESH_TOKEN_4"),
-        "scope": "create",
-        "request_count": 0,
-        "error_count": 0,
-        "last_used": 0,
-        "status": "active"
-    },
-    {
-        "name": "Token5_Create",
-        "client_id": os.getenv("ZOHO_CLIENT_ID_5"),
-        "client_secret": os.getenv("ZOHO_CLIENT_SECRET_5"),
-        "refresh_token": os.getenv("ZOHO_REFRESH_TOKEN_5"),
-        "scope": "create",
-        "request_count": 0,
-        "error_count": 0,
-        "last_used": 0,
-        "status": "active"
-    }
-]
-
-# Remove tokens with missing credentials
-ZOHO_TOKENS = [t for t in ZOHO_TOKENS if t["client_id"] and t["client_secret"] and t["refresh_token"]]
-
-# Backward compatibility
-ZOHO_CLIENT_ID = os.getenv("ZOHO_CLIENT_ID") or os.getenv("ZOHO_CLIENT_ID_3")
-ZOHO_CLIENT_SECRET = os.getenv("ZOHO_CLIENT_SECRET") or os.getenv("ZOHO_CLIENT_SECRET_3")
-ZOHO_REFRESH_TOKEN = os.getenv("ZOHO_REFRESH_TOKEN") or os.getenv("ZOHO_REFRESH_TOKEN_3")
-
-# Thread-safe token rotation
-token_lock = threading.Lock()
-current_read_index = 0
-current_create_index = 0
-
-print("="*80)
-print("TOKEN POOL INITIALIZATION")
-print("="*80)
-for token in ZOHO_TOKENS:
-    print(f"✓ Loaded: {token['name']} (scope: {token['scope']})")
-print(f"\nTotal READ tokens: {sum(1 for t in ZOHO_TOKENS if t['scope'] == 'read')}")
-print(f"Total CREATE tokens: {sum(1 for t in ZOHO_TOKENS if t['scope'] == 'create')}")
-print("="*80 + "\n")
-
-app = FastAPI(title="OCR API - Optimized Streaming Version")
+app = FastAPI(title="OCR API - Complete with Vision (NEW API)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -185,898 +43,24 @@ app.add_middleware(
 
 os.makedirs("uploads", exist_ok=True)
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
-
-# ============================================================
-# TOKEN MANAGEMENT
-# ============================================================
-
-def get_zoho_token(scope_needed: str = "read", max_retries: int = None) -> tuple:
-    """Get Zoho token with automatic fallback"""
-    global current_read_index, current_create_index
-    
-    available_tokens = [t for t in ZOHO_TOKENS if t["scope"] == scope_needed and t["status"] != "disabled"]
-    
-    if not available_tokens:
-        print(f"[TOKEN] ✗ No {scope_needed} tokens available")
-        return None, None
-    
-    if max_retries is None:
-        max_retries = len(available_tokens)
-    
-    with token_lock:
-        if scope_needed == "read":
-            start_index = current_read_index
-        else:
-            start_index = current_create_index
-        
-        for attempt in range(min(max_retries, len(available_tokens))):
-            token_index = (start_index + attempt) % len(available_tokens)
-            token_config = available_tokens[token_index]
-            
-            try:
-                time_since_last = time.time() - token_config["last_used"]
-                if time_since_last < 0.3:
-                    time.sleep(0.3 - time_since_last)
-                
-                token_url = "https://accounts.zoho.com/oauth/v2/token"
-                params = {
-                    "refresh_token": token_config["refresh_token"],
-                    "client_id": token_config["client_id"],
-                    "client_secret": token_config["client_secret"],
-                    "grant_type": "refresh_token"
-                }
-                
-                response = requests.post(token_url, params=params, timeout=10)
-                response.raise_for_status()
-                
-                access_token = response.json()["access_token"]
-                token_name = token_config["name"]
-                
-                token_config["last_used"] = time.time()
-                token_config["request_count"] += 1
-                
-                if scope_needed == "read":
-                    current_read_index = (token_index + 1) % len(available_tokens)
-                else:
-                    current_create_index = (token_index + 1) % len(available_tokens)
-                
-                print(f"[TOKEN] ✓ Using {token_name} (scope: {scope_needed}) - Request #{token_config['request_count']}")
-                
-                return access_token, token_name
-                
-            except requests.exceptions.HTTPError as e:
-                token_config["error_count"] += 1
-                
-                if hasattr(e, 'response') and e.response.status_code == 400:
-                    print(f"[TOKEN] ✗ {token_config['name']} - Invalid refresh token, marking as disabled")
-                    token_config["status"] = "disabled"
-                else:
-                    print(f"[TOKEN] ✗ {token_config['name']} - HTTP error: {e}")
-                
-                if attempt < max_retries - 1:
-                    print(f"[TOKEN] → Trying next token (attempt {attempt + 2}/{max_retries})...")
-                    continue
-                
-            except Exception as e:
-                token_config["error_count"] += 1
-                print(f"[TOKEN] ✗ {token_config['name']} - Error: {e}")
-                
-                if attempt < max_retries - 1:
-                    print(f"[TOKEN] → Trying next token (attempt {attempt + 2}/{max_retries})...")
-                    continue
-    
-    print(f"[TOKEN] ✗ All {scope_needed} tokens failed")
-    return None, None
-
-
-def retry_on_network_error(max_retries=3, delay=2):
-    """
-    Decorator to retry function on network errors
-    Handles: Errno 35 (Resource temporarily unavailable)
-    """
-    def decorator(func):
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            last_error = None
-            
-            for attempt in range(max_retries):
-                try:
-                    return func(*args, **kwargs)
-                    
-                except Exception as e:
-                    last_error = e
-                    error_msg = str(e).lower()
-                    
-                    # Check if it's a network/connection error
-                    is_network_error = any([
-                        "errno 35" in error_msg,
-                        "resource temporarily unavailable" in error_msg,
-                        "connection reset" in error_msg,
-                        "broken pipe" in error_msg,
-                        "timeout" in error_msg
-                    ])
-                    
-                    if is_network_error and attempt < max_retries - 1:
-                        wait_time = delay * (attempt + 1)  # Progressive delay
-                        print(f"[RETRY] Network error on attempt {attempt + 1}/{max_retries}")
-                        print(f"[RETRY] Waiting {wait_time}s before retry...")
-                        time.sleep(wait_time)
-                        continue
-                    else:
-                        # Not a network error or last attempt
-                        raise
-            
-            # All retries failed
-            raise last_error
-        
-        return wrapper
-    return decorator
-
-def extract_all_image_urls(field_value, max_images=5):
-    """Extract ALL image URLs from Zoho field (up to max_images)"""
-    if not field_value:
-        return []
-    
-    urls = []
-    
-    # Handle string (single URL)
-    if isinstance(field_value, str):
-        if field_value.startswith(('http', '/api/v2.1/')):
-            urls.append(field_value)
-    
-    # Handle list (multiple URLs)
-    elif isinstance(field_value, list):
-        for item in field_value[:max_images]:  # Limit to max_images
-            if isinstance(item, str) and item.startswith(('http', '/api/v2.1/')):
-                urls.append(item)
-            elif isinstance(item, dict) and item.get("download_url"):
-                urls.append(item["download_url"])
-    
-    # Handle dict (single URL in object)
-    elif isinstance(field_value, dict) and field_value.get("download_url"):
-        urls.append(field_value["download_url"])
-    
-    return urls[:max_images]  # Safety limit
-
-
-def get_zoho_access_token():
-    """Legacy function with fallback"""
-    if not all([ZOHO_CLIENT_ID, ZOHO_CLIENT_SECRET, ZOHO_REFRESH_TOKEN]):
-        print("[ZOHO AUTH] ⚠️ Legacy OAuth not configured, trying token pool...")
-        return get_zoho_token(scope_needed="create")[0]
-    
-    try:
-        token_url = "https://accounts.zoho.com/oauth/v2/token"
-        params = {
-            "refresh_token": ZOHO_REFRESH_TOKEN,
-            "client_id": ZOHO_CLIENT_ID,
-            "client_secret": ZOHO_CLIENT_SECRET,
-            "grant_type": "refresh_token"
-        }
-        
-        response = requests.post(token_url, params=params, timeout=10)
-        response.raise_for_status()
-        
-        access_token = response.json()["access_token"]
-        print("[ZOHO AUTH] ✓ Legacy token obtained")
-        return access_token
-        
-    except Exception as e:
-        print(f"[ZOHO AUTH] ✗ Legacy token failed: {e}, trying token pool...")
-        return get_zoho_token(scope_needed="create")[0]
-
-# ✅ NEW: Add retry decorator
-@retry_on_network_error(max_retries=3, delay=2)
-def update_job_status(job_id: str, data: Dict[str, Any]):
-    """Update job status in Supabase with retry on network errors"""
-    print(f"[SUPABASE] Updating job {job_id}")
-    
-    result = supabase.table("auto_extraction_jobs")\
-        .update(data)\
-        .eq("job_id", job_id)\
-        .execute()
-    
-    print(f"[SUPABASE] ✓ Job updated")
-    return result
-    
-# ============================================================
-# SUPABASE STORAGE FUNCTIONS
-# ============================================================
-@retry_on_network_error(max_retries=3, delay=2)
-def upload_to_supabase_storage(file_content: bytes, filename: str, folder: str = "auto-extract") -> str:
-    """Upload image to Supabase Storage"""
-    if not supabase:
-        raise Exception("Supabase not configured")
-    
-    try:
-        timestamp = int(time.time() * 1000)
-        unique_filename = f"{folder}/{timestamp}_{filename}"
-        
-        result = supabase.storage.from_(SUPABASE_BUCKET).upload(
-            unique_filename,
-            file_content,
-            file_options={"content-type": "image/jpeg"}
-        )
-        
-        public_url = supabase.storage.from_(SUPABASE_BUCKET).get_public_url(unique_filename)
-        
-        print(f"[SUPABASE STORAGE] ✓ Uploaded: {unique_filename}")
-        return public_url
-        
-    except Exception as e:
-        print(f"[SUPABASE STORAGE] ✗ Upload failed: {e}")
-        raise
-
-
-def save_extraction_result(
-    job_id: str,
-    record_id: str,
-    app_link_name: str,
-    report_link_name: str,
-    student_name: str,
-    bank_image_supabase: Optional[str],
-    bill_image_supabase: Optional[List[str]],  # ✅ Now accepts array
-    bank_data: Optional[Dict],
-    bill_data: Optional[List[Dict]],  # ✅ Now accepts array
-    status: str,
-    error_message: Optional[str] = None,
-    processing_time_ms: Optional[int] = None,
-    tokens_used: Optional[int] = None,
-    cost_usd: Optional[float] = None
-):
-    """Save extraction result to Supabase"""
-    if not supabase:
-        return None
-    
-    try:
-        data = {
-            "job_id": job_id,
-            "record_id": record_id,
-            "app_link_name": app_link_name,
-            "report_link_name": report_link_name,
-            "student_name": student_name,
-            "bank_image_supabase": bank_image_supabase,
-            "bill_image_supabase": bill_image_supabase,  # ✅ Can be array now
-            "bank_data": bank_data,
-            "bill_data": bill_data,  # ✅ Can be array now
-            "status": status,
-            "error_message": error_message,
-            "processing_time_ms": processing_time_ms,
-            "tokens_used": tokens_used,
-            "cost_usd": float(cost_usd) if cost_usd else 0.0,
-            "processed_at": datetime.now().isoformat()
-        }
-        
-        result = supabase.table("auto_extraction_results").insert(data).execute()
-        return result.data[0] if result.data else None
-        
-    except Exception as e:
-        print(f"[SUPABASE] ✗ Failed to save result: {e}")
-        raise
-
-# FIND THIS:
-def update_job_status(job_id: str, data: Dict[str, Any]):
-    """Update job status in Supabase"""
-    print(f"[SUPABASE] Updating job {job_id}: {data}")
-    
-    try:
-        result = supabase.table("auto_extraction_jobs")\
-            .update(data)\
-            .eq("job_id", job_id)\
-            .execute()
-        
-        print(f"[SUPABASE] ✓ Job updated")
-        return result
-    except Exception as e:
-        print(f"[SUPABASE] ✗ Failed to update job: {e}")
-        raise
-
-# ============================================================
-# ZOHO FETCH FUNCTIONS
-# ============================================================
-
-def fetch_specific_records_by_ids(app_link_name: str, report_link_name: str, record_ids: List[str]) -> List[Dict]:
-    """
-    ✅ OPTIMIZED: Use numeric ID format for Zoho criteria
-    """
-    if not record_ids:
-        return []
-    
-    try:
-        batch_size = 100
-        all_records = []
-        
-        for i in range(0, len(record_ids), batch_size):
-            batch_ids = record_ids[i:i + batch_size]
-            
-            # ✅ Don't quote numeric IDs
-            criteria_parts = [f'ID == {rid}' for rid in batch_ids]
-            criteria = " || ".join(criteria_parts)
-            
-            access_token, token_name = get_zoho_token(scope_needed="read")
-            
-            if not access_token:
-                raise Exception("Failed to get READ token")
-            
-            api_url = f"https://creator.zoho.com/api/v2.1/{app_link_name}/report/{report_link_name}"
-            
-            headers = {
-                "Authorization": f"Zoho-oauthtoken {access_token}"
-            }
-            
-            params = {
-                "criteria": criteria,
-                "from": 1,
-                "limit": 200
-            }
-            
-            print(f"[ZOHO FETCH] ✅ Fetching {len(batch_ids)} specific records...")
-            
-            response = requests.get(api_url, headers=headers, params=params, timeout=30)
-            response.raise_for_status()
-            
-            data = response.json()
-            records = data.get("data", [])
-            
-            all_records.extend(records)
-            print(f"[ZOHO FETCH] ✓ Fetched {len(records)} records from batch")
-            
-            if i + batch_size < len(record_ids):
-                time.sleep(0.5)
-        
-        print(f"[ZOHO FETCH] ✓ Total fetched: {len(all_records)} records")
-        return all_records
-        
-    except Exception as e:
-        print(f"[ZOHO FETCH] ✗ Error: {e}")
-        raise
-
-
-def fetch_zoho_records(app_link_name: str, report_link_name: str, 
-                       criteria: Optional[str] = None, 
-                       max_records: int = 1000) -> List[Dict]:
-    """
-    Fetch records from Zoho Creator using READ tokens
-    """
-    try:
-        access_token, token_name = get_zoho_token(scope_needed="read")
-        
-        if not access_token:
-            raise Exception("Failed to get READ token")
-        
-        api_url = f"https://creator.zoho.com/api/v2.1/{app_link_name}/report/{report_link_name}"
-        
-        headers = {
-            "Authorization": f"Zoho-oauthtoken {access_token}"
-        }
-        
-        params = {
-            "from": 1,
-            "limit": 200
-        }
-        
-        if criteria:
-            params["criteria"] = criteria
-        
-        all_records = []
-        page = 1
-        
-        print(f"[ZOHO FETCH] Fetching records from {report_link_name}...")
-        if criteria:
-            print(f"[ZOHO FETCH] Filter: {criteria}")
-        
-        response = requests.get(api_url, headers=headers, params=params, timeout=30)
-        
-        if response.status_code == 403:
-            print(f"[ZOHO FETCH] ✗ 403 Forbidden Error")
-            raise Exception("403 Forbidden: Check OAuth scopes and permissions")
-        
-        response.raise_for_status()
-        
-        data = response.json()
-        records = data.get("data", [])
-        
-        if not records:
-            print(f"[ZOHO FETCH] ✓ No records found")
-            return []
-        
-        all_records.extend(records)
-        print(f"[ZOHO FETCH] Page {page}: {len(records)} records")
-        
-        # Paginate if needed
-        while len(records) == 200 and len(all_records) < max_records:
-            page += 1
-            params["from"] = (page - 1) * 200 + 1
-            
-            response = requests.get(api_url, headers=headers, params=params, timeout=30)
-            response.raise_for_status()
-            
-            data = response.json()
-            records = data.get("data", [])
-            
-            if not records:
-                break
-            
-            all_records.extend(records)
-            print(f"[ZOHO FETCH] Page {page}: {len(records)} records")
-            
-            time.sleep(0.5)
-        
-        print(f"[ZOHO FETCH] ✓ Total fetched: {len(all_records)} records")
-        return all_records
-        
-    except Exception as e:
-        print(f"[ZOHO FETCH] ✗ Error: {e}")
-        raise
-
-
-def download_file_from_url(file_url: str, max_retries: int = 3) -> tuple:
-    """Download file from URL with Zoho OAuth support"""
-    print(f"[DOWNLOAD] Downloading from URL...")
-    
-    if file_url.startswith('/api/v2.1/'):
-        zoho_domain = "creator.zoho.com"
-        file_url = f"https://{zoho_domain}{file_url}"
-        print(f"[DOWNLOAD] Converted relative path to: {file_url[:100]}...")
-    
-    for attempt in range(max_retries):
-        try:
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
-            }
-            
-            if "creator.zoho.com" in file_url or "creator.zoho.in" in file_url:
-                print("[DOWNLOAD] Detected Zoho Creator URL, using OAuth...")
-                
-                access_token, token_name = get_zoho_token(scope_needed="read")
-                
-                if not access_token:
-                    print("[DOWNLOAD] Trying legacy token...")
-                    access_token = get_zoho_access_token()
-                    token_name = "Legacy Token"
-                
-                if access_token:
-                    headers["Authorization"] = f"Zoho-oauthtoken {access_token}"
-                    print(f"[DOWNLOAD] ✓ OAuth authentication added ({token_name})")
-            
-            response = requests.get(file_url, timeout=30, headers=headers, stream=True)
-            response.raise_for_status()
-            
-            content_type = response.headers.get('Content-Type', '').lower()
-            
-            if 'text/html' in content_type:
-                raise Exception(f"Zoho returned HTML error page")
-            
-            file_content = response.content
-            
-            if len(file_content) < 100:
-                raise Exception(f"Downloaded file too small: {len(file_content)} bytes")
-            
-            # Verify file signature
-            is_jpeg = file_content[:2] == b'\xff\xd8'
-            is_png = file_content[:4] == b'\x89PNG'
-            is_pdf = file_content[:4] == b'%PDF'
-            is_gif = file_content[:3] == b'GIF'
-            is_webp = file_content[8:12] == b'WEBP'
-            
-            if not any([is_jpeg, is_png, is_pdf, is_gif, is_webp]):
-                raise Exception(f"Downloaded file is not a valid image/PDF")
-            
-            filename = file_url.split('/')[-1].split('?')[0]
-            
-            if 'filepath=' in file_url:
-                import urllib.parse
-                parsed = urllib.parse.urlparse(file_url)
-                params = urllib.parse.parse_qs(parsed.query)
-                if 'filepath' in params:
-                    filename = params['filepath'][0]
-            
-            if not any(filename.lower().endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.pdf', '.gif', '.webp']):
-                if is_jpeg:
-                    filename = "downloaded_file.jpg"
-                elif is_png:
-                    filename = "downloaded_file.png"
-                elif is_pdf:
-                    filename = "downloaded_file.pdf"
-                elif is_gif:
-                    filename = "downloaded_file.gif"
-                elif is_webp:
-                    filename = "downloaded_file.webp"
-            
-            print(f"[DOWNLOAD] ✓ Downloaded: {filename} ({len(file_content):,} bytes)")
-            
-            return file_content, filename
-            
-        except Exception as e:
-            print(f"[DOWNLOAD] ✗ Error (attempt {attempt + 1}/{max_retries}): {str(e)}")
-            if attempt < max_retries - 1:
-                wait_time = (attempt + 1) * 2
-                print(f"[DOWNLOAD] Retrying in {wait_time}s...")
-                time.sleep(wait_time)
-            else:
-                raise
-    
-    raise Exception("Failed to download file after all retries")
-
-
-def create_zoho_record(app_link_name: str, form_link_name: str, data_map: dict) -> dict:
-    """Create record in Zoho Creator"""
-    try:
-        access_token, token_name = get_zoho_token(scope_needed="create")
-        
-        if not access_token:
-            print("[CREATE] ✗ Failed to get create token")
-            return {"success": False, "error": "No create token available"}
-        
-        create_url = f"https://creator.zoho.com/api/v2.1/{app_link_name}/form/{form_link_name}"
-        
-        headers = {
-            "Authorization": f"Zoho-oauthtoken {access_token}",
-            "Content-Type": "application/json"
-        }
-        
-        payload = {"data": data_map}
-        
-        print(f"[CREATE] Creating record in {form_link_name}...")
-        
-        response = requests.post(create_url, json=payload, headers=headers, timeout=15)
-        response.raise_for_status()
-        
-        result = response.json()
-        print(f"[CREATE] ✓ Record created successfully")
-        
-        return {"success": True, "data": result}
-        
-    except Exception as e:
-        print(f"[CREATE] ✗ Error: {e}")
-        import traceback
-        traceback.print_exc()
-        return {"success": False, "error": str(e)}
-
-
-def update_source_record(app_link_name: str, report_link_name: str, 
-                        record_id: str, field_name: str, field_value: str) -> bool:
-    """Update source record"""
-    try:
-        access_token, token_name = get_zoho_token(scope_needed="create")
-        
-        if not access_token:
-            print("[UPDATE] ✗ Failed to get create token")
-            return False
-        
-        update_url = f"https://creator.zoho.com/api/v2.1/{app_link_name}/report/{report_link_name}/{record_id}"
-        
-        headers = {
-            "Authorization": f"Zoho-oauthtoken {access_token}",
-            "Content-Type": "application/json"
-        }
-        
-        payload = {"data": {field_name: field_value}}
-        
-        print(f"[UPDATE] Marking record {record_id}...")
-        
-        response = requests.patch(update_url, json=payload, headers=headers, timeout=10)
-        response.raise_for_status()
-        
-        print(f"[UPDATE] ✓ Record marked: {field_value}")
-        return True
-        
-    except Exception as e:
-        print(f"[UPDATE] ✗ Error: {e}")
-        return False
-
-# ============================================================
-# ✅ NEW: CHECK FOR ACTIVE JOBS
-# ============================================================
-
-def check_active_jobs_for_records(record_ids: List[str]) -> Optional[str]:
-    """Check if any of the records are currently being processed"""
-    if not supabase or not record_ids:
-        return None
-    
-    try:
-        # Check for running jobs with overlapping records
-        response = supabase.table("auto_extraction_jobs")\
-            .select("job_id, status")\
-            .in_("status", ["pending", "running"])\
-            .execute()
-        
-        if not response.data:
-            return None
-        
-        # For each active job, check if it's processing any of our records
-        for job in response.data:
-            job_id = job["job_id"]
-            
-            # Get records being processed by this job
-            results = supabase.table("auto_extraction_results")\
-                .select("record_id")\
-                .eq("job_id", job_id)\
-                .execute()
-            
-            if results.data:
-                active_record_ids = {str(r["record_id"]) for r in results.data}
-                overlap = set(record_ids) & active_record_ids
-                
-                if overlap:
-                    print(f"[DUPLICATE CHECK] Found {len(overlap)} records already being processed in job {job_id}")
-                    return job_id
-        
-        return None
-        
-    except Exception as e:
-        print(f"[DUPLICATE CHECK] Error: {e}")
-        return None
-
+zoho_bulk = ZohoBulkAPI()
 
 
 # ============================================================
-# ✅ IMPROVED: EXTRACTION WORKER with Better Error Handling
+# Cost calculation function
 # ============================================================
-
-def process_extraction_job(job_id: str, config: Dict):
-    """
-    ✅ IMPROVED: Better error handling and logging + Multiple bill images support
-    """
-    if not supabase:
-        print("[AUTO EXTRACT] ✗ Supabase not configured")
-        return
-    
-    try:
-        print(f"\n{'='*80}")
-        print(f"[AUTO EXTRACT] Starting Streaming Job: {job_id}")
-        print(f"{'='*80}\n")
-        
-        update_job_status(job_id, {
-            "status": "running",
-            "started_at": datetime.now().isoformat()
-        })
-        
-        selected_ids = config.get('selected_record_ids', [])
-        
-        # ✅ Fetch records
-        if selected_ids:
-            records = fetch_specific_records_by_ids(
-                app_link_name=config['app_link_name'],
-                report_link_name=config['report_link_name'],
-                record_ids=selected_ids
-            )
-        else:
-            records = fetch_zoho_records(
-                app_link_name=config['app_link_name'],
-                report_link_name=config['report_link_name'],
-                criteria=config.get('filter_criteria')
-            )
-        
-        print(f"[AUTO EXTRACT] Processing {len(records)} records in real-time...")
-        update_job_status(job_id, {"total_records": len(records)})
-        
-        if not records:
-            update_job_status(job_id, {
-                "status": "completed",
-                "completed_at": datetime.now().isoformat()
-            })
-            return
-        
-        total_cost = 0.0
-        processed = 0
-        successful = 0
-        failed = 0
-        
-        def extract_student_name(record):
-            for field in ["Name", "Student_Name", "Scholar_Name"]:
-                name_value = record.get(field)
-                if not name_value:
-                    continue
-                if isinstance(name_value, str):
-                    return name_value
-                if isinstance(name_value, dict):
-                    if name_value.get("zc_display_value"):
-                        return name_value["zc_display_value"]
-                    parts = []
-                    for key in ['prefix', 'first_name', 'last_name', 'suffix']:
-                        if name_value.get(key):
-                            parts.append(name_value[key])
-                    if parts:
-                        return " ".join(parts)
-            return "Unknown"
-        
-        # ✅ Process records with streaming
-        for idx, record in enumerate(records, 1):
-            record_start = time.time()
-            
-            record_id = str(record.get("ID"))
-            student_name = extract_student_name(record)
-            
-            print(f"\n[AUTO EXTRACT] [{idx}/{len(records)}] {student_name} (ID: {record_id})")
-            
-            bank_image_url_supabase = None
-            bill_images_supabase = []  # ✅ Changed to array
-            bank_data = None
-            bill_data_array = []  # ✅ Changed to array
-            record_tokens = 0
-            record_cost = 0.0
-            error_msg = None
-
-            try:
-                # ✅ Process Bank Image
-                if config.get('bank_field_name'):
-                    bank_field_value = record.get(config['bank_field_name'])
-                    bank_zoho_urls = extract_all_image_urls(bank_field_value, max_images=1)
-                    
-                    if bank_zoho_urls:
-                        bank_zoho_url = bank_zoho_urls[0]
-                        try:
-                            print(f"[AUTO EXTRACT]   📥 Downloading bank image...")
-                            file_content, filename = download_file_from_url(bank_zoho_url)
-                            
-                            print(f"[AUTO EXTRACT]   🤖 Processing with Gemini Vision...")
-                            result = process_single_file(file_content, filename, "bank")
-                            
-                            if result.get('success'):
-                                bank_data = result
-                                tokens = result.get('token_usage', {})
-                                record_tokens += tokens.get('total_tokens', 0)
-                                record_cost += calculate_cost(
-                                    tokens.get('input_tokens', 0),
-                                    tokens.get('output_tokens', 0),
-                                    'gemini_vision'
-                                )
-                                
-                                bank_image_url_supabase = upload_to_supabase_storage(
-                                    file_content,
-                                    f"bank_{record_id}_{filename}",
-                                    folder="auto-extract/bank"
-                                )
-                                
-                                print(f"[AUTO EXTRACT]   ✅ Bank extracted & stored")
-                            else:
-                                error_detail = result.get('error', 'Unknown error')
-                                print(f"[AUTO EXTRACT]   ✗ Bank OCR failed: {error_detail}")
-                                if not error_msg:
-                                    error_msg = f"Bank OCR failed: {error_detail}"
-                        except Exception as e:
-                            print(f"[AUTO EXTRACT]   ✗ Bank processing failed: {str(e)}")
-                            if not error_msg:
-                                error_msg = f"Bank processing error: {str(e)}"
-                    else:
-                        print(f"[AUTO EXTRACT]   ⚠️ No bank image URL found")
-                
-                # ✅ Process Bill Images (MULTIPLE)
-                if config.get('bill_field_name'):
-                    bill_field_value = record.get(config['bill_field_name'])
-                    bill_zoho_urls = extract_all_image_urls(bill_field_value, max_images=5)  # Get ALL URLs
-                    
-                    if bill_zoho_urls:
-                        print(f"[AUTO EXTRACT]   📥 Found {len(bill_zoho_urls)} bill images")
-                        
-                        for bill_idx, bill_zoho_url in enumerate(bill_zoho_urls, 1):
-                            try:
-                                print(f"[AUTO EXTRACT]   📥 Downloading bill {bill_idx}/{len(bill_zoho_urls)}...")
-                                file_content, filename = download_file_from_url(bill_zoho_url)
-                                
-                                print(f"[AUTO EXTRACT]   🤖 Processing bill {bill_idx} with Gemini Vision...")
-                                result = process_single_file(file_content, filename, "bill")
-                                
-                                if result.get('success'):
-                                    bill_data_array.append(result)
-                                    tokens = result.get('token_usage', {})
-                                    record_tokens += tokens.get('total_tokens', 0)
-                                    record_cost += calculate_cost(
-                                        tokens.get('input_tokens', 0),
-                                        tokens.get('output_tokens', 0),
-                                        'gemini_vision'
-                                    )
-                                    
-                                    bill_image_url = upload_to_supabase_storage(
-                                        file_content,
-                                        f"bill{bill_idx}_{record_id}_{filename}",
-                                        folder="auto-extract/bills"
-                                    )
-                                    bill_images_supabase.append(bill_image_url)
-                                    
-                                    print(f"[AUTO EXTRACT]   ✅ Bill {bill_idx} extracted & stored")
-                                else:
-                                    error_detail = result.get('error', 'Unknown error')
-                                    print(f"[AUTO EXTRACT]   ✗ Bill {bill_idx} OCR failed: {error_detail}")
-                                    if not error_msg:
-                                        error_msg = f"Bill {bill_idx} OCR failed: {error_detail}"
-                                    
-                            except Exception as e:
-                                print(f"[AUTO EXTRACT]   ✗ Bill {bill_idx} processing failed: {str(e)}")
-                                if not error_msg:
-                                    error_msg = f"Bill {bill_idx} processing error: {str(e)}"
-                    else:
-                        print(f"[AUTO EXTRACT]   ⚠️ No bill images found")
-                        
-                # ✅ Determine status
-                if bank_data or bill_data_array:  # ✅ Check if we have any data
-                    status = "success"
-                    successful += 1
-                else:
-                    status = "failed"
-                    failed += 1
-                    if not error_msg:
-                        error_msg = "No images found or OCR failed for both documents"
-                
-            except Exception as record_error:
-                # ✅ Catch any unexpected errors for this record
-                status = "failed"
-                failed += 1
-                error_msg = f"Record processing error: {str(record_error)}"
-                print(f"[AUTO EXTRACT]   ✗ Record failed: {error_msg}")
-                import traceback
-                traceback.print_exc()
-            
-            processing_time = int((time.time() - record_start) * 1000)
-            
-            # ✅ ALWAYS save result (success or failure)
-            try:
-                save_extraction_result(
-                    job_id=job_id,
-                    record_id=record_id,
-                    app_link_name=config['app_link_name'],
-                    report_link_name=config['report_link_name'],
-                    student_name=student_name,
-                    bank_image_supabase=bank_image_url_supabase,
-                    bill_image_supabase=bill_images_supabase,  # ✅ Array of URLs
-                    bank_data=bank_data,
-                    bill_data=bill_data_array,  # ✅ Array of OCR results
-                    status=status,
-                    error_message=error_msg,
-                    processing_time_ms=processing_time,
-                    tokens_used=record_tokens,
-                    cost_usd=record_cost
-                )
-            except Exception as save_error:
-                print(f"[AUTO EXTRACT]   ✗ Failed to save result: {save_error}")
-            
-            total_cost += record_cost
-            processed += 1
-            
-            # ✅ Update progress
-            update_job_status(job_id, {
-                "processed_records": processed,
-                "successful_records": successful,
-                "failed_records": failed,
-                "total_cost_usd": round(total_cost, 6)
-            })
-            
-            print(f"[AUTO EXTRACT]   💰 Cost: ${record_cost:.6f} | ⏱️ Time: {processing_time}ms | Status: {status}")
-            
-            # Rate limiting
-            time.sleep(0.3)
-        
-        # Job completed
-        update_job_status(job_id, {
-            "status": "completed",
-            "completed_at": datetime.now().isoformat(),
-            "total_cost_usd": round(total_cost, 6)
-        })
-        
-        print(f"\n{'='*80}")
-        print(f"[AUTO EXTRACT] ✅ Job Completed: {job_id}")
-        print(f"[AUTO EXTRACT]   Success: {successful}/{len(records)}")
-        print(f"[AUTO EXTRACT]   Failed: {failed}/{len(records)}")
-        print(f"[AUTO EXTRACT]   Total Cost: ${total_cost:.6f}")
-        print(f"{'='*80}\n")
-        
-    except Exception as e:
-        print(f"[AUTO EXTRACT] ✗ Job failed: {e}")
-        import traceback
-        traceback.print_exc()
-        
-        update_job_status(job_id, {
-            "status": "failed",
-            "completed_at": datetime.now().isoformat()
-        })
-        
-# ============================================================
-# HELPER FUNCTIONS
-# ============================================================
-
 def calculate_cost(input_tokens: int, output_tokens: int, method: str) -> float:
-    """Calculate cost based on Gemini pricing"""
+    """
+    Calculate cost based on Gemini pricing (2.5 Flash)
+    FREE TIER LIMITS:
+    - 15 requests/minute
+    - 1,000 requests/day
+    
+    PAID PRICING (after free tier):
+    - Input: $0.075 per 1M tokens
+    - Output: $0.30 per 1M tokens
+    - Images: ~258 tokens standard
+    """
     if method == "gemini_vision":
         cost = (input_tokens / 1_000_000) * 0.075 + (output_tokens / 1_000_000) * 0.30
     else:
@@ -1111,14 +95,72 @@ def get_bank_name_from_ifsc(ifsc_code: str) -> str:
     return bank_codes.get(bank_code, f"Bank ({bank_code})")
 
 
+def validate_file_format(file_content: bytes, filename: str) -> dict:
+    """Validate file format"""
+    result = {
+        "valid": False,
+        "format": "Unknown",
+        "size": len(file_content),
+        "message": ""
+    }
+    
+    if len(file_content) < 10:
+        result["message"] = "File is too small"
+        return result
+    
+    if file_content[:4] == b'\x89PNG':
+        result["valid"] = True
+        result["format"] = "PNG"
+    elif file_content[:2] == b'\xff\xd8':
+        result["valid"] = True
+        result["format"] = "JPEG"
+    elif file_content[:4] == b'%PDF':
+        result["valid"] = True
+        result["format"] = "PDF"
+    
+    result["message"] = f"Valid {result['format']} file" if result["valid"] else "Unknown format"
+    return result
+
+
+def download_file_from_url(file_url: str) -> tuple:
+    """Download file from URL"""
+    print(f"[DOWNLOAD] Downloading from URL...")
+    
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+        }
+        
+        response = requests.get(file_url, timeout=30, headers=headers, stream=True)
+        response.raise_for_status()
+        
+        file_content = response.content
+        filename = file_url.split('/')[-1].split('?')[0]
+        
+        if not any(filename.lower().endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.pdf']):
+            filename = "downloaded_file.jpg"
+        
+        print(f"[DOWNLOAD] ✓ Downloaded: {filename} ({len(file_content):,} bytes)")
+        return file_content, filename
+        
+    except Exception as e:
+        print(f"[DOWNLOAD] ✗ Error: {str(e)}")
+        raise
+
+
 def process_single_file(file_content: bytes, filename: str, doc_type: str) -> dict:
-    """Process a single file using Gemini Vision"""
+    """
+    Process a single file using Gemini Vision
+    ✅ Handles images and PDFs
+    """
     start_time = time.time()
     
     try:
         def calculate_tokens(text):
+            """1 token ≈ 4 characters"""
             return max(1, len(text) // 4)
         
+        # Check if Gemini is available
         if not USE_GEMINI:
             return {
                 "error": "Gemini Vision not configured. Please set GEMINI_API_KEY.",
@@ -1128,6 +170,7 @@ def process_single_file(file_content: bytes, filename: str, doc_type: str) -> di
         
         print(f"[PROCESS] Using Gemini Vision...")
         
+        # ✅ Handle PDF files
         image_content = file_content
         original_filename = filename
         converted_from_pdf = False
@@ -1145,10 +188,12 @@ def process_single_file(file_content: bytes, filename: str, doc_type: str) -> di
                 if len(images) == 0:
                     raise Exception("No pages in PDF")
                 
+                # Convert PIL Image to bytes
                 from io import BytesIO
                 img_byte_arr = BytesIO()
                 images[0].save(img_byte_arr, format='JPEG', quality=95)
                 
+                # ✅ Update file_content with converted image
                 file_content = img_byte_arr.getvalue()
                 image_content = file_content
                 filename = filename.replace('.pdf', '.jpg').replace('.PDF', '.jpg')
@@ -1165,18 +210,21 @@ def process_single_file(file_content: bytes, filename: str, doc_type: str) -> di
                 if os.path.exists(temp_pdf_path):
                     os.unlink(temp_pdf_path)
         
-        input_tokens = 258
+        # Process with Gemini Vision
+        input_tokens = 258  # Standard Gemini image token cost
         
         if doc_type == "bank":
-            result = analyze_bank_gemini_vision(image_content, filename)
-            
-            gemini_bank_name = result.get('bank_name')
-            if not gemini_bank_name or gemini_bank_name == 'null':
-                ifsc = result.get('ifsc_code')
-                result['bank_name'] = get_bank_name_from_ifsc(ifsc or '')
+          result = analyze_bank_gemini_vision(image_content, filename)
+    
+    # ✅ FIXED: Prioritize Gemini's bank name, use IFSC only as fallback
+          gemini_bank_name = result.get('bank_name')
+          if not gemini_bank_name or gemini_bank_name == 'null':
+               ifsc = result.get('ifsc_code')
+               result['bank_name'] = get_bank_name_from_ifsc(ifsc or '')
         else:
             result = analyze_bill_gemini_vision(image_content, filename)
         
+        # Save image (always save as image, not PDF)
         image_id = str(uuid.uuid4())
         if converted_from_pdf:
             image_ext = ".jpg"
@@ -1187,6 +235,7 @@ def process_single_file(file_content: bytes, filename: str, doc_type: str) -> di
         with open(save_path, "wb") as f:
             f.write(image_content)
         
+        # Use environment variable for base URL or default to localhost
         base_url = os.environ.get("RENDER_EXTERNAL_URL", "http://localhost:8000")
         image_url = f"{base_url}/uploads/{image_id}{image_ext}"
         
@@ -1226,571 +275,705 @@ def process_single_file(file_content: bytes, filename: str, doc_type: str) -> di
 @app.get("/")
 async def root():
     return {
-        "service": "OCR API - Optimized Streaming Version",
-        "version": "12.0 - STREAMING",
+        "service": "OCR API - Gemini Vision",
+        "version": "5.0",
         "features": [
-            "✅ Gemini Vision OCR",
-            "✅ Multi-token OAuth (8 tokens)",
-            "✅ Real-time streaming processing",
-            "✅ No pre-download wait time",
-            "✅ Smart deduplication",
-            "✅ Instant preview loading"
+            "✅ Gemini Vision (NEW API - most accurate)",
+            "✅ PDF support with automatic conversion",
+            "✅ Bank passbook extraction",
+            "✅ College bill extraction",
+            "✅ Batch processing"
         ],
-        "tokens_configured": {
-            "total_tokens": len(ZOHO_TOKENS),
-            "read_tokens": sum(1 for t in ZOHO_TOKENS if t["scope"] == "read"),
-            "create_tokens": sum(1 for t in ZOHO_TOKENS if t["scope"] == "create"),
-            "active_tokens": sum(1 for t in ZOHO_TOKENS if t["status"] == "active"),
-            "disabled_tokens": sum(1 for t in ZOHO_TOKENS if t["status"] == "disabled")
-        },
-        "supabase_status": "✅ Connected" if supabase else "❌ Not configured",
-        "gemini_vision_status": "✅ Available" if USE_GEMINI else "❌ Not configured"
+        "gemini_vision_status": "✅ Available" if USE_GEMINI else "❌ Not configured",
+        "endpoints": {
+            "POST /ocr/bank": "Process bank passbook",
+            "POST /ocr/bill": "Process college bill",
+            "GET /health": "Health check",
+            "GET /stats": "Usage statistics",
+            "GET /logs": "Processing logs"
+        }
     }
 
 
-@app.post("/ocr/auto-extract/fetch-fields")
-async def fetch_report_fields(
-    app_link_name: str = Form(...),
-    report_link_name: str = Form(...)
+@app.post("/ocr/bank")
+async def process_bank_passbook(
+    files: List[UploadFile] = File(default=[]),
+    file: Optional[UploadFile] = File(None),
+    File_upload_Bank: Optional[UploadFile] = File(None),
+    file_url: Optional[str] = Form(None),
+    File_upload_Bank_url: Optional[str] = Form(None),
+    scholarship_id: Optional[str] = Form(None),
+    student_name: Optional[str] = Form(None)
 ):
-    """
-    Fetch report schema/fields for dropdown selection
-    """
+    """Process bank passbook - supports single or multiple files"""
     try:
-        print(f"[FETCH FIELDS] Fetching schema for {report_link_name}...")
+        print(f"\n{'='*80}")
+        print(f"[BANK OCR] Processing bank passbook(s)")
+        if student_name:
+            print(f"[BANK OCR] Student: {student_name}")
+        print(f"{'='*80}")
         
-        # Fetch just 1 record to get field schema
-        records = fetch_zoho_records(
-            app_link_name=app_link_name,
-            report_link_name=report_link_name,
-            max_records=1
+        # Collect files
+        files_to_process = []
+        
+        if files:
+            for uploaded_file in files:
+                file_content = await uploaded_file.read()
+                files_to_process.append((file_content, uploaded_file.filename))
+        elif file or File_upload_Bank:
+            uploaded_file = file or File_upload_Bank
+            file_content = await uploaded_file.read()
+            files_to_process.append((file_content, uploaded_file.filename))
+        elif file_url or File_upload_Bank_url:
+            url = file_url or File_upload_Bank_url
+            file_content, filename = download_file_from_url(url)
+            files_to_process.append((file_content, filename))
+        else:
+            return JSONResponse(status_code=400, content={
+                "success": False,
+                "error": "No file provided"
+            })
+        
+        print(f"[BANK OCR] Processing {len(files_to_process)} file(s)")
+        
+        # Process all files
+        results = []
+        total_tokens = {"input": 0, "output": 0, "total": 0}
+        
+        for file_content, filename in files_to_process:
+            validation = validate_file_format(file_content, filename)
+            if not validation['valid']:
+                results.append({
+                    "filename": filename,
+                    "success": False,
+                    "error": f"Invalid file: {validation['message']}"
+                })
+                continue
+            
+            result = process_single_file(file_content, filename, "bank")
+            
+            # Calculate cost and log
+            token_usage = result.get('token_usage', {})
+            input_tok = token_usage.get('input_tokens', 0)
+            output_tok = token_usage.get('output_tokens', 0)
+            cost = calculate_cost(input_tok, output_tok, result.get('method', 'unknown'))
+            
+            log_processing(
+                doc_type="bank",
+                filename=filename,
+                method=result.get('method', 'unknown'),
+                input_tokens=input_tok,
+                output_tokens=output_tok,
+                total_tokens=token_usage.get('total_tokens', 0),
+                cost_usd=cost,
+                success=result.get('success', False),
+                error_message=result.get('error'),
+                student_name=student_name,
+                scholarship_id=scholarship_id,
+                extracted_data=result if result.get('success') else None,
+                processing_time_ms=result.get('processing_time_ms'),
+                image_url=result.get('image_url')
+            )
+            
+            if result.get('success'):
+                total_tokens["input"] += input_tok
+                total_tokens["output"] += output_tok
+                total_tokens["total"] += token_usage.get('total_tokens', 0)
+            
+            results.append({
+                "filename": filename,
+                **result
+            })
+            
+            print(f"[BANK OCR] ✓ Completed: {filename}")
+            print(f"[BANK OCR]   Cost: ${cost}")
+        
+        print(f"{'='*80}\n")
+        
+        if len(results) == 1:
+            return JSONResponse(content=results[0])
+        else:
+            return JSONResponse(content={
+                "success": True,
+                "total_files": len(results),
+                "results": results,
+                "total_token_usage": total_tokens
+            })
+        
+    except Exception as e:
+        print(f"[BANK OCR] ✗ Error: {str(e)}")
+        
+        log_processing(
+            doc_type="bank",
+            filename="unknown",
+            method="error",
+            input_tokens=0,
+            output_tokens=0,
+            total_tokens=0,
+            cost_usd=0.0,
+            success=False,
+            error_message=str(e),
+            student_name=student_name,
+            scholarship_id=scholarship_id
         )
         
-        if not records or len(records) == 0:
+        return JSONResponse(status_code=500, content={"success": False, "error": str(e)})
+
+
+@app.post("/ocr/bill")
+async def process_bill(
+    files: List[UploadFile] = File(default=[]),
+    file: Optional[UploadFile] = File(None),
+    file_url: Optional[str] = Form(None),
+    scholarship_id: Optional[str] = Form(None),
+    student_name: Optional[str] = Form(None)
+):
+    """Process college bill - supports single or multiple files"""
+    try:
+        print(f"\n{'='*80}")
+        print(f"[BILL OCR] Processing bill(s)")
+        if student_name:
+            print(f"[BILL OCR] Student: {student_name}")
+        print(f"{'='*80}")
+        
+        # Collect files
+        files_to_process = []
+        
+        if files:
+            for uploaded_file in files:
+                file_content = await uploaded_file.read()
+                files_to_process.append((file_content, uploaded_file.filename))
+        elif file:
+            file_content = await file.read()
+            files_to_process.append((file_content, file.filename))
+        elif file_url:
+            file_content, filename = download_file_from_url(file_url)
+            files_to_process.append((file_content, filename))
+        else:
+            return JSONResponse(status_code=400, content={
+                "success": False,
+                "error": "No file provided"
+            })
+        
+        print(f"[BILL OCR] Processing {len(files_to_process)} file(s)")
+        
+        results = []
+        total_tokens = {"input": 0, "output": 0, "total": 0}
+        
+        for file_content, filename in files_to_process:
+            validation = validate_file_format(file_content, filename)
+            if not validation['valid']:
+                results.append({
+                    "filename": filename,
+                    "success": False,
+                    "error": f"Invalid file: {validation['message']}"
+                })
+                continue
+            
+            result = process_single_file(file_content, filename, "bill")
+            
+            # Calculate cost and log
+            token_usage = result.get('token_usage', {})
+            input_tok = token_usage.get('input_tokens', 0)
+            output_tok = token_usage.get('output_tokens', 0)
+            cost = calculate_cost(input_tok, output_tok, result.get('method', 'unknown'))
+            
+            log_processing(
+                doc_type="bill",
+                filename=filename,
+                method=result.get('method', 'unknown'),
+                input_tokens=input_tok,
+                output_tokens=output_tok,
+                total_tokens=token_usage.get('total_tokens', 0),
+                cost_usd=cost,
+                success=result.get('success', False),
+                error_message=result.get('error'),
+                student_name=student_name,
+                scholarship_id=scholarship_id,
+                extracted_data=result if result.get('success') else None,
+                processing_time_ms=result.get('processing_time_ms'),
+                image_url=result.get('image_url')
+            )
+            
+            if result.get('success'):
+                total_tokens["input"] += input_tok
+                total_tokens["output"] += output_tok
+                total_tokens["total"] += token_usage.get('total_tokens', 0)
+            
+            results.append({
+                "filename": filename,
+                **result
+            })
+            
+            print(f"[BILL OCR] ✓ Completed: {filename}")
+            print(f"[BILL OCR]   Cost: ${cost}")
+        
+        print(f"{'='*80}\n")
+        
+        if len(results) == 1:
+            return JSONResponse(content=results[0])
+        else:
+            return JSONResponse(content={
+                "success": True,
+                "total_files": len(results),
+                "results": results,
+                "total_token_usage": total_tokens
+            })
+        
+    except Exception as e:
+        print(f"[BILL OCR] ✗ Error: {str(e)}")
+        
+        log_processing(
+            doc_type="bill",
+            filename="unknown",
+            method="error",
+            input_tokens=0,
+            output_tokens=0,
+            total_tokens=0,
+            cost_usd=0.0,
+            success=False,
+            error_message=str(e),
+            student_name=student_name,
+            scholarship_id=scholarship_id
+        )
+        
+        return JSONResponse(status_code=500, content={"success": False, "error": str(e)})
+
+
+@app.get("/stats")
+async def get_stats(days: int = 30):
+    """Get usage statistics"""
+    try:
+        stats = get_usage_stats(days)
+        return JSONResponse(content=stats)
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@app.get("/logs")
+async def get_logs(limit: int = 100):
+    """Get processing logs"""
+    try:
+        logs = get_all_logs(limit)
+        return JSONResponse(content={"logs": logs})
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@app.delete("/logs/{log_id}")
+async def remove_log(log_id: int):
+    """Delete a processing log"""
+    try:
+        success = delete_log(log_id)
+        if success:
+            return {"success": True, "message": "Log deleted"}
+        else:
+            return JSONResponse(status_code=404, content={"success": False, "message": "Log not found"})
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.post("/sync/bulk-push-to-zoho")
+async def bulk_push_to_zoho(limit: int = 1000):
+    """Bulk push records from Supabase to Zoho Creator FORM"""
+    try:
+        print(f"\n{'='*80}")
+        print(f"INITIATING BULK SYNC TO ZOHO CREATOR FORM")
+        print(f"{'='*80}")
+        
+        # Fetch records from Supabase
+        print(f"[FETCH] Loading records from Supabase...")
+        
+        from supabase import create_client
+        supabase_url = os.getenv("VITE_SUPABASE_URL", "https://ohfnriyabohbvgxebllt.supabase.co")
+        supabase_key = os.getenv("VITE_SUPABASE_ANON_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9oZm5yaXlhYm9oYnZneGVibGx0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3MzQ2ODI2MTksImV4cCI6MjA1MDI1ODYxOX0.KI_E7vVgzDPpKj5Sh0fZvfaG7h5mq6c5NmqfvU7vU7c")
+        supabase = create_client(supabase_url, supabase_key)
+        
+        response = supabase.table('auto_extraction_results').select('*').limit(limit).execute()
+        records = response.data
+        
+        if not records:
             return JSONResponse(content={
                 "success": False,
-                "error": "No records found in report"
+                "message": "No records found in Supabase"
             })
         
-        first_record = records[0]
-        all_fields = list(first_record.keys())
+        print(f"[FETCH] ✓ Loaded {len(records)} records from Supabase")
         
-        file_fields = []
-        text_fields = []
-        
-        for field_name in all_fields:
-            field_value = first_record.get(field_name)
-            
-            is_file = False
-            
-            if isinstance(field_value, str):
-                if field_value.startswith(('http', '/api/v2.1/')):
-                    is_file = True
-            elif isinstance(field_value, list) and len(field_value) > 0:
-                first_item = field_value[0]
-                if isinstance(first_item, str) and first_item.startswith(('http', '/api/v2.1/')):
-                    is_file = True
-                elif isinstance(first_item, dict) and first_item.get("download_url"):
-                    is_file = True
-            elif isinstance(field_value, dict) and field_value.get("download_url"):
-                is_file = True
-            
-            if is_file:
-                file_fields.append(field_name)
-            else:
-                text_fields.append(field_name)
+        # Bulk push to Zoho Form
+        result = zoho_bulk.bulk_insert(records)
         
         return JSONResponse(content={
             "success": True,
-            "total_fields": len(all_fields),
-            "file_fields": sorted(file_fields),
-            "text_fields": sorted(text_fields),
-            "all_fields": sorted(all_fields),
-            "sample_record": {k: str(v)[:100] for k, v in first_record.items()}
+            "message": f"Bulk sync completed: {result['successful']}/{result['total_records']} successful",
+            "details": result
         })
         
     except Exception as e:
-        print(f"[FETCH FIELDS] ✗ Error: {str(e)}")
+        print(f"[ERROR] Bulk sync failed: {str(e)}")
         import traceback
         traceback.print_exc()
-        return JSONResponse(status_code=500, content={
-            "success": False,
-            "error": str(e)
-        })
-
-
-def get_already_extracted_record_ids(app_link_name: str, report_link_name: str) -> set:
-    """Get IDs of records that have already been successfully extracted"""
-    if not supabase:
-        return set()
-    
-    try:
-        response = supabase.table("auto_extraction_results")\
-            .select("record_id")\
-            .eq("app_link_name", app_link_name)\
-            .eq("report_link_name", report_link_name)\
-            .eq("status", "success")\
-            .execute()
         
-        if response.data:
-            extracted_ids = {str(r["record_id"]) for r in response.data}
-            print(f"[FILTER] Found {len(extracted_ids)} already extracted records")
-            return extracted_ids
-        
-        return set()
-        
-    except Exception as e:
-        print(f"[FILTER] Error checking extracted records: {e}")
-        return set()
-
-
-@app.post("/ocr/auto-extract/preview")
-async def preview_extraction(
-    app_link_name: str = Form(...),
-    report_link_name: str = Form(...),
-    bank_field_name: Optional[str] = Form(None),
-    bill_field_name: Optional[str] = Form(None),
-    filter_criteria: Optional[str] = Form(None),
-    store_images: bool = Form(False)
-):
-    """
-    ✅ OPTIMIZED: Fast metadata loading, excludes already extracted records
-    """
-    try:
-        print(f"[PREVIEW] Fetching records from {report_link_name}...")
-        
-        # ✅ Get already extracted record IDs
-        already_extracted = get_already_extracted_record_ids(app_link_name, report_link_name)
-        
-        # ✅ Only fetch metadata (fast!)
-        records = fetch_zoho_records(
-            app_link_name=app_link_name,
-            report_link_name=report_link_name,
-            criteria=filter_criteria,
-            max_records=1000
-        )
-        
-        # ✅ Filter out already extracted records
-        records = [r for r in records if str(r.get("ID", "")) not in already_extracted]
-        
-        total_count = len(records)
-        
-        if already_extracted:
-            print(f"[PREVIEW] ✅ Filtered out {len(already_extracted)} already extracted records")
-            print(f"[PREVIEW] ✅ Showing {total_count} new/pending records")
-        
-        def extract_name(record):
-            for field in ["Name", "Student_Name", "Scholar_Name"]:
-                name_value = record.get(field)
-                if not name_value:
-                    continue
-                if isinstance(name_value, str):
-                    return name_value
-                if isinstance(name_value, dict):
-                    if name_value.get("zc_display_value"):
-                        return name_value["zc_display_value"]
-                    parts = []
-                    for key in ['prefix', 'first_name', 'last_name', 'suffix']:
-                        if name_value.get(key):
-                            parts.append(name_value[key])
-                    if parts:
-                        return " ".join(parts)
-            return "Unknown"
-        
-        def extract_image_url(field_value):
-            """Extract image URL from Zoho field"""
-            if not field_value:
-                return None
-            
-            if isinstance(field_value, str):
-                if field_value.startswith(('http', '/api/v2.1/')):
-                    return field_value
-            elif isinstance(field_value, list) and len(field_value) > 0:
-                first_item = field_value[0]
-                if isinstance(first_item, str) and first_item.startswith(('http', '/api/v2.1/')):
-                    return first_item
-                elif isinstance(first_item, dict) and first_item.get("download_url"):
-                    return first_item["download_url"]
-            elif isinstance(field_value, dict) and field_value.get("download_url"):
-                return field_value["download_url"]
-            
-            return None
-        
-        all_records = []
-        
-        # ✅ Quick metadata extraction (no image downloads!)
-        for record in records:
-            record_id = str(record.get("ID", ""))
-            student_name = extract_name(record)
-            
-            bank_value = record.get(bank_field_name) if bank_field_name else None
-            bill_value = record.get(bill_field_name) if bill_field_name else None
-            
-            bank_url = extract_image_url(bank_value)
-            bill_url = extract_image_url(bill_value)
-            
-            record_data = {
-                "record_id": record_id,
-                "student_name": student_name,
-                "has_bank_image": bank_url is not None,
-                "has_bill_image": bill_url is not None
-            }
-            all_records.append(record_data)
-        
-        print(f"[PREVIEW] ✅ Loaded {total_count} pending records instantly")
-        
-        return JSONResponse(content={
-            "success": True,
-            "total_records": total_count,
-            "already_extracted_count": len(already_extracted),
-            "sample_records": all_records[:1000],
-            "filter_applied": filter_criteria is not None,
-            "filter_criteria": filter_criteria,
-            "fields": {
-                "bank_field": bank_field_name,
-                "bill_field": bill_field_name
-            },
-            "estimated_cost": f"${total_count * 0.003:.4f}",
-            "estimated_time_minutes": math.ceil(total_count * 3 / 60),
-            "message": f"✅ Ready to process {total_count} new records instantly (excluded {len(already_extracted)} already extracted)",
-            "optimization": "Streaming mode - no wait time!"
-        })
-        
-    except Exception as e:
-        print(f"[PREVIEW] ✗ Error: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        return JSONResponse(status_code=500, content={
-            "success": False,
-            "error": str(e)
-        })
-
-
-# ============================================================
-# ✅ IMPROVED: START EXTRACTION with Duplicate Check
-# ============================================================
-
-@app.post("/ocr/auto-extract/start")
-async def start_extraction(
-    app_link_name: str = Form(...),
-    report_link_name: str = Form(...),
-    bank_field_name: Optional[str] = Form(None),
-    bill_field_name: Optional[str] = Form(None),
-    filter_criteria: Optional[str] = Form(None),
-    selected_record_ids: Optional[str] = Form(None)
-):
-    """
-    ✅ IMPROVED: Check for duplicate jobs and already extracted records before starting
-    """
-    if not supabase:
-        return JSONResponse(status_code=500, content={
-            "success": False,
-            "error": "Supabase not configured. Please set SUPABASE_URL and SUPABASE_KEY."
-        })
-    
-    try:
-        # Parse and deduplicate selected IDs
-        selected_ids = []
-        if selected_record_ids:
-            try:
-                raw_ids = json.loads(selected_record_ids)
-                seen = set()
-                selected_ids = []
-                for rid in raw_ids:
-                    rid_str = str(rid)
-                    if rid_str not in seen:
-                        seen.add(rid_str)
-                        selected_ids.append(rid_str)
-                
-                duplicates_removed = len(raw_ids) - len(selected_ids)
-                if duplicates_removed > 0:
-                    print(f"[START] ✅ Removed {duplicates_removed} duplicate IDs")
-                
-                print(f"[START] Selected {len(selected_ids)} unique records")
-            except Exception as parse_error:
-                print(f"[START] Failed to parse IDs: {parse_error}")
-        
-        # ✅ Filter out already extracted records
-        already_extracted = get_already_extracted_record_ids(app_link_name, report_link_name)
-        
-        if selected_ids:
-            original_count = len(selected_ids)
-            selected_ids = [rid for rid in selected_ids if rid not in already_extracted]
-            filtered_count = original_count - len(selected_ids)
-            
-            if filtered_count > 0:
-                print(f"[START] ✅ Filtered out {filtered_count} already extracted records")
-            
-            if len(selected_ids) == 0:
-                return JSONResponse(status_code=400, content={
-                    "success": False,
-                    "error": "All selected records have already been extracted",
-                    "message": "⚠️ No new records to process"
-                })
-        
-        # ✅ Check for active jobs with same records
-        if selected_ids:
-            active_job = check_active_jobs_for_records(selected_ids)
-            if active_job:
-                return JSONResponse(status_code=409, content={
-                    "success": False,
-                    "error": f"These records are already being processed in job {active_job}",
-                    "active_job_id": active_job,
-                    "message": "⚠️ Duplicate job detected. Please wait for the current job to complete."
-                })
-        
-        job_id = f"job_{int(time.time())}_{uuid.uuid4().hex[:8]}"
-        
-        config = {
-            "app_link_name": app_link_name,
-            "report_link_name": report_link_name,
-            "bank_field_name": bank_field_name,
-            "bill_field_name": bill_field_name,
-            "filter_criteria": filter_criteria,
-            "selected_record_ids": selected_ids
-        }
-        
-        # Save job to Supabase
-        supabase.table("auto_extraction_jobs").insert({
-            "job_id": job_id,
-            "app_link_name": app_link_name,
-            "report_link_name": report_link_name,
-            "bank_field_name": bank_field_name,
-            "bill_field_name": bill_field_name,
-            "filter_criteria": filter_criteria,
-            "status": "pending"
-        }).execute()
-        
-        # Start background processing
-        thread = threading.Thread(
-            target=process_extraction_job,
-            args=(job_id, config)
-        )
-        thread.daemon = True
-        thread.start()
-        
-        return JSONResponse(content={
-            "success": True,
-            "job_id": job_id,
-            "status": "started",
-            "message": f"🚀 Processing {len(selected_ids)} new records in real-time",
-            "optimization": "Streaming mode - no wait time!",
-            "check_status_url": f"/ocr/auto-extract/status/{job_id}"
-        })
-        
-    except Exception as e:
-        return JSONResponse(status_code=500, content={
-            "success": False,
-            "error": str(e)
-        })
-
-@app.get("/ocr/auto-extract/status/{job_id}")
-async def get_job_status(job_id: str):
-    """Get extraction job status"""
-    if not supabase:
-        return JSONResponse(status_code=500, content={
-            "success": False,
-            "error": "Supabase not configured"
-        })
-    
-    try:
-        response = supabase.table("auto_extraction_jobs")\
-            .select("*")\
-            .eq("job_id", job_id)\
-            .execute()
-        
-        if not response.data:
-            return JSONResponse(status_code=404, content={
+        return JSONResponse(
+            status_code=500,
+            content={
                 "success": False,
-                "error": "Job not found"
-            })
-        
-        job = response.data[0]
-        
-        progress_percent = 0
-        if job.get("total_records", 0) > 0:
-            progress_percent = round(
-                (job.get("processed_records", 0) / job["total_records"]) * 100, 2
-            )
-        
-        return JSONResponse(content={
-            "success": True,
-            "job_id": job_id,
-            "status": job["status"],
-            "progress": {
-                "total_records": job.get("total_records", 0),
-                "processed_records": job.get("processed_records", 0),
-                "successful_records": job.get("successful_records", 0),
-                "failed_records": job.get("failed_records", 0),
-                "progress_percent": progress_percent
-            },
-            "cost": {
-                "total_cost_usd": float(job.get("total_cost_usd", 0))
-            },
-            "timestamps": {
-                "created_at": job.get("created_at"),
-                "started_at": job.get("started_at"),
-                "completed_at": job.get("completed_at")
+                "error": str(e)
             }
-        })
-        
-    except Exception as e:
-        return JSONResponse(status_code=500, content={
-            "success": False,
-            "error": str(e)
-        })
+        )
 
 
-@app.get("/ocr/auto-extract/results/{job_id}")
-async def get_job_results(
-    job_id: str,
-    limit: int = 100,
-    offset: int = 0,
-    status_filter: Optional[str] = None
-):
-    """Get extraction results for a job"""
-    if not supabase:
-        return JSONResponse(status_code=500, content={
-            "success": False,
-            "error": "Supabase not configured"
-        })
-    
+@app.get("/sync/test-zoho-connection")
+async def test_zoho_connection():
+    """Test Zoho Creator FORM connection"""
     try:
-        query = supabase.table("auto_extraction_results")\
-            .select("*")\
-            .eq("job_id", job_id)\
-            .order("created_at", desc=True)\
-            .range(offset, offset + limit - 1)
-        
-        if status_filter:
-            query = query.eq("status", status_filter)
-        
-        response = query.execute()
+        result = zoho_bulk.test_connection()
         
         return JSONResponse(content={
-            "success": True,
-            "job_id": job_id,
-            "total_results": len(response.data),
-            "results": response.data
+            "success": result['success'],
+            "message": "Zoho Form connection test",
+            "result": result
         })
         
     except Exception as e:
-        return JSONResponse(status_code=500, content={
-            "success": False,
-            "error": str(e)
-        })
-
-
-@app.get("/ocr/auto-extract/jobs")
-async def list_jobs(limit: int = 20):
-    """List all extraction jobs"""
-    if not supabase:
-        return JSONResponse(status_code=500, content={
-            "success": False,
-            "error": "Supabase not configured"
-        })
-    
-    try:
-        response = supabase.table("auto_extraction_jobs")\
-            .select("*")\
-            .order("created_at", desc=True)\
-            .limit(limit)\
-            .execute()
-        
-        return JSONResponse(content={
-            "success": True,
-            "total_jobs": len(response.data),
-            "jobs": response.data
-        })
-        
-    except Exception as e:
-        return JSONResponse(status_code=500, content={
-            "success": False,
-            "error": str(e)
-        })
-
-
-@app.get("/token-stats")
-async def get_token_stats():
-    """Get detailed token usage statistics"""
-    
-    read_tokens = []
-    create_tokens = []
-    
-    for token in ZOHO_TOKENS:
-        token_stat = {
-            "name": token["name"],
-            "scope": token["scope"],
-            "status": token["status"],
-            "requests": token["request_count"],
-            "errors": token["error_count"],
-            "success_rate": round(
-                (token["request_count"] - token["error_count"]) / token["request_count"] * 100
-                if token["request_count"] > 0 else 100, 2
-            ),
-            "last_used_seconds_ago": int(time.time() - token["last_used"]) if token["last_used"] > 0 else None
-        }
-        
-        if token["scope"] == "read":
-            read_tokens.append(token_stat)
-        else:
-            create_tokens.append(token_stat)
-    
-    return {
-        "total_tokens": len(ZOHO_TOKENS),
-        "active_tokens": sum(1 for t in ZOHO_TOKENS if t["status"] == "active"),
-        "disabled_tokens": sum(1 for t in ZOHO_TOKENS if t["status"] == "disabled"),
-        "read_tokens": {
-            "count": len(read_tokens),
-            "tokens": read_tokens
-        },
-        "create_tokens": {
-            "count": len(create_tokens),
-            "tokens": create_tokens
-        },
-        "optimization": "✅ Streaming processing enabled"
-    }
-
+        return JSONResponse(
+            status_code=500,
+            content={"success": False, "error": str(e)}
+        )
 
 @app.get("/health")
 async def health():
     return {
         "status": "healthy",
-        "service": "OCR API - Optimized Streaming Version",
-        "version": "12.0 - STREAMING",
-        "gemini_vision": "enabled" if USE_GEMINI else "disabled",
-        "supabase": "connected" if supabase else "not configured",
-        "tokens": {
-            "total": len(ZOHO_TOKENS),
-            "read_tokens": sum(1 for t in ZOHO_TOKENS if t["scope"] == "read"),
-            "create_tokens": sum(1 for t in ZOHO_TOKENS if t["scope"] == "create"),
-            "active": sum(1 for t in ZOHO_TOKENS if t["status"] == "active"),
-            "disabled": sum(1 for t in ZOHO_TOKENS if t["status"] == "disabled")
-        },
-        "optimizations": [
-            "✅ Streaming processing",
-            "✅ No pre-download wait",
-            "✅ Real-time progress updates",
-            "✅ Smart deduplication",
-            "✅ Instant preview loading"
-        ]
+        "service": "OCR API - Gemini Vision",
+        "version": "5.0",
+        "gemini_vision": "enabled" if USE_GEMINI else "disabled"
     }
+
+
+@app.post("/sync/bulk-push-to-zoho-selected")
+async def bulk_push_selected_to_zoho(request: dict):
+    """
+    Bulk push selected records to Zoho Creator
+    """
+    try:
+        records = request.get('records', [])
+        
+        if not records:
+            return JSONResponse(content={
+                "success": False,
+                "error": "No records provided"
+            })
+        
+        print(f"\n{'='*80}")
+        print(f"PUSHING {len(records)} SELECTED RECORDS TO ZOHO")
+        print(f"{'='*80}\n")
+        
+        # Use existing bulk push functionality
+        result = zoho_bulk.bulk_insert(records)
+        
+        return JSONResponse(content={
+            "success": True,
+            "message": f"Pushed {result['successful']}/{result['total_records']} records",
+            "details": result
+        })
+        
+    except Exception as e:
+        print(f"[ERROR] {str(e)}")
+        return JSONResponse(
+            status_code=500,
+            content={"success": False, "error": str(e)}
+        )
+        
+# ============================================================
+# 🆕 NEW ENDPOINTS - Add these here
+# ============================================================
+
+@app.get("/stats/student/{student_name}")
+async def get_student_stats(student_name: str):
+    """Get stats for a specific student"""
+    try:
+        from database import get_logs_by_student
+        logs = get_logs_by_student(student_name)
+        
+        total_cost = sum(float(log.get('cost_usd', 0)) for log in logs)
+        
+        return JSONResponse(content={
+            "student_name": student_name,
+            "total_requests": len(logs),
+            "total_cost_usd": round(total_cost, 6),
+            "logs": logs
+        })
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@app.get("/stats/scholarship/{scholarship_id}")
+async def get_scholarship_stats(scholarship_id: str):
+    """Get stats for a specific scholarship"""
+    try:
+        from database import get_logs_by_scholarship
+        logs = get_logs_by_scholarship(scholarship_id)
+        
+        total_cost = sum(float(log.get('cost_usd', 0)) for log in logs)
+        
+        return JSONResponse(content={
+            "scholarship_id": scholarship_id,
+            "total_requests": len(logs),
+            "total_cost_usd": round(total_cost, 6),
+            "logs": logs
+        })
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@app.get("/stats/total-cost")
+async def get_total_api_cost():
+    """Get total cost across all processing"""
+    try:
+        from database import get_total_cost
+        total = get_total_cost()
+        
+        return JSONResponse(content={
+            "total_cost_usd": total,
+            "message": f"Total API cost: ${total}"
+        })
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.post("/ocr/generic")
+async def process_generic_document(
+    files: List[UploadFile] = File(default=[]),
+    file: Optional[UploadFile] = File(None),
+    file_url: Optional[str] = Form(None),
+    extraction_prompt: str = Form(...),  # Required custom prompt
+    student_name: Optional[str] = Form(None),
+    scholarship_id: Optional[str] = Form(None)
+):
+    """Generic OCR - Extract anything based on user's custom prompt"""
+    try:
+        print(f"\n{'='*80}")
+        print(f"[GENERIC OCR] Processing document(s)")
+        print(f"[GENERIC OCR] Extraction prompt: {extraction_prompt[:100]}...")
+        print(f"{'='*80}")
+        
+        # Collect files
+        files_to_process = []
+        
+        if files:
+            for uploaded_file in files:
+                file_content = await uploaded_file.read()
+                files_to_process.append((file_content, uploaded_file.filename))
+        elif file:
+            file_content = await file.read()
+            files_to_process.append((file_content, file.filename))
+        elif file_url:
+            file_content, filename = download_file_from_url(file_url)
+            files_to_process.append((file_content, filename))
+        else:
+            return JSONResponse(status_code=400, content={
+                "success": False,
+                "error": "No file provided"
+            })
+        
+        print(f"[GENERIC OCR] Processing {len(files_to_process)} file(s)")
+        
+        results = []
+        total_tokens = {"input": 0, "output": 0, "total": 0}
+        
+        for file_content, filename in files_to_process:
+            validation = validate_file_format(file_content, filename)
+            if not validation['valid']:
+                results.append({
+                    "filename": filename,
+                    "success": False,
+                    "error": f"Invalid file: {validation['message']}"
+                })
+                continue
+            
+            # Use generic processing
+            result = process_generic_file(file_content, filename, extraction_prompt)
+            
+            # Calculate cost and log
+            token_usage = result.get('token_usage', {})
+            input_tok = token_usage.get('input_tokens', 0)
+            output_tok = token_usage.get('output_tokens', 0)
+            cost = calculate_cost(input_tok, output_tok, result.get('method', 'unknown'))
+            
+            log_processing(
+                doc_type="generic",
+                filename=filename,
+                method=result.get('method', 'unknown'),
+                input_tokens=input_tok,
+                output_tokens=output_tok,
+                total_tokens=token_usage.get('total_tokens', 0),
+                cost_usd=cost,
+                success=result.get('success', False),
+                error_message=result.get('error'),
+                student_name=student_name,
+                scholarship_id=scholarship_id,
+                extracted_data=result if result.get('success') else None,
+                processing_time_ms=result.get('processing_time_ms'),
+                image_url=result.get('image_url')
+            )
+            
+            if result.get('success'):
+                total_tokens["input"] += input_tok
+                total_tokens["output"] += output_tok
+                total_tokens["total"] += token_usage.get('total_tokens', 0)
+            
+            results.append({
+                "filename": filename,
+                **result
+            })
+            
+            print(f"[GENERIC OCR] ✓ Completed: {filename}")
+            print(f"[GENERIC OCR]   Cost: ${cost}")
+        
+        print(f"{'='*80}\n")
+        
+        if len(results) == 1:
+            return JSONResponse(content=results[0])
+        else:
+            return JSONResponse(content={
+                "success": True,
+                "total_files": len(results),
+                "results": results,
+                "total_token_usage": total_tokens
+            })
+        
+    except Exception as e:
+        print(f"[GENERIC OCR] ✗ Error: {str(e)}")
+        
+        log_processing(
+            doc_type="generic",
+            filename="unknown",
+            method="error",
+            input_tokens=0,
+            output_tokens=0,
+            total_tokens=0,
+            cost_usd=0.0,
+            success=False,
+            error_message=str(e),
+            student_name=student_name,
+            scholarship_id=scholarship_id
+        )
+        
+        return JSONResponse(status_code=500, content={"success": False, "error": str(e)})
+
+
+def process_generic_file(file_content: bytes, filename: str, extraction_prompt: str) -> dict:
+    """Process any document with custom extraction prompt"""
+    start_time = time.time()
+    
+    try:
+        from ai_analyzer import analyze_generic_gemini_vision, USE_GEMINI
+        
+        def calculate_tokens(text):
+            return max(1, len(text) // 4)
+        
+        if not USE_GEMINI:
+            return {
+                "error": "Gemini Vision not configured. Please set GEMINI_API_KEY.",
+                "success": False,
+                "filename": filename
+            }
+        
+        print(f"[PROCESS] Using Gemini Vision for generic extraction...")
+        
+        # Handle PDF conversion
+        image_content = file_content
+        original_filename = filename
+        converted_from_pdf = False
+        
+        if filename.lower().endswith('.pdf'):
+            print(f"[PROCESS] Converting PDF to image...")
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp_pdf:
+                temp_pdf.write(file_content)
+                temp_pdf_path = temp_pdf.name
+            
+            try:
+                from pdf2image import convert_from_path
+                images = convert_from_path(temp_pdf_path, first_page=1, last_page=1, dpi=300)
+                
+                if len(images) == 0:
+                    raise Exception("No pages in PDF")
+                
+                from io import BytesIO
+                img_byte_arr = BytesIO()
+                images[0].save(img_byte_arr, format='JPEG', quality=95)
+                
+                file_content = img_byte_arr.getvalue()
+                image_content = file_content
+                filename = filename.replace('.pdf', '.jpg').replace('.PDF', '.jpg')
+                converted_from_pdf = True
+                
+                print(f"[PROCESS] ✓ PDF converted to image")
+            except ImportError:
+                return {
+                    "error": "pdf2image not installed",
+                    "success": False,
+                    "filename": original_filename
+                }
+            finally:
+                if os.path.exists(temp_pdf_path):
+                    os.unlink(temp_pdf_path)
+        
+        # Process with Gemini Vision using custom prompt
+        input_tokens = 258
+        result = analyze_generic_gemini_vision(image_content, filename, extraction_prompt)
+        
+        # Save image
+        image_id = str(uuid.uuid4())
+        image_ext = ".jpg" if converted_from_pdf else (os.path.splitext(original_filename)[1] or ".jpg")
+        save_path = f"uploads/{image_id}{image_ext}"
+        
+        with open(save_path, "wb") as f:
+            f.write(image_content)
+        
+        base_url = os.environ.get("RENDER_EXTERNAL_URL", "http://localhost:8000")
+        image_url = f"{base_url}/uploads/{image_id}{image_ext}"
+        
+        response_text = json.dumps(result)
+        output_tokens = calculate_tokens(response_text)
+        processing_time_ms = int((time.time() - start_time) * 1000)
+        
+        result['success'] = True
+        result['method'] = 'gemini_vision'
+        result['filename'] = original_filename
+        result['token_usage'] = {
+            'input_tokens': input_tokens,
+            'output_tokens': output_tokens,
+            'total_tokens': input_tokens + output_tokens
+        }
+        result['processing_time_ms'] = processing_time_ms
+        result['image_url'] = image_url
+        
+        return result
+        
+    except Exception as e:
+        print(f"[PROCESS] ✗ Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "error": str(e),
+            "success": False,
+            "filename": filename
+        }
 
 
 if __name__ == "__main__":
     import uvicorn
     
+    # Get port from environment (Render provides PORT variable)
     port = int(os.environ.get("PORT", 8000))
     
     print("="*80)
-    print("OCR API - OPTIMIZED STREAMING VERSION (v12.0)")
+    print("OCR API - GEMINI VISION ONLY")
     print("="*80)
-    print(f"✅ Gemini Vision: {'ENABLED' if USE_GEMINI else 'DISABLED'}")
-    print(f"✅ Supabase: {'CONNECTED' if supabase else 'NOT CONFIGURED'}")
-    print(f"✅ Multi-token OAuth: {len(ZOHO_TOKENS)} tokens")
-    print(f"✅ Streaming processing (no wait time)")
-    print(f"✅ Real-time progress updates")
-    print(f"✅ Instant preview loading")
+    print(f"✓ Gemini Vision: {'ENABLED ✅' if USE_GEMINI else 'DISABLED ❌'}")
+    print("✓ PDF support with auto-conversion")
+    print("✓ Bank passbook + Bill extraction")
+    print("✓ Batch processing")
     print("="*80)
     print(f"\nStarting server on http://0.0.0.0:{port}")
     print("="*80 + "\n")
