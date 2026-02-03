@@ -534,7 +534,7 @@ def fetch_specific_records_by_ids(app_link_name: str, report_link_name: str, rec
 
 def fetch_zoho_records(app_link_name: str, report_link_name: str, 
                        criteria: Optional[str] = None, 
-                       max_records: int = None) -> List[Dict]:  # ✅ None means unlimited
+                       max_records: int = 1000) -> List[Dict]:
     """
     Fetch records from Zoho Creator using READ tokens
     """
@@ -583,13 +583,8 @@ def fetch_zoho_records(app_link_name: str, report_link_name: str,
         all_records.extend(records)
         print(f"[ZOHO FETCH] Page {page}: {len(records)} records")
         
-        # ✅ Paginate until no more records (or hit max_records if specified)
-        while len(records) == 200:
-            # Check if we've hit the limit
-            if max_records and len(all_records) >= max_records:
-                print(f"[ZOHO FETCH] ✓ Reached max_records limit: {max_records}")
-                break
-            
+        # Paginate if needed
+        while len(records) == 200 and len(all_records) < max_records:
             page += 1
             params["from"] = (page - 1) * 200 + 1
             
@@ -603,21 +598,17 @@ def fetch_zoho_records(app_link_name: str, report_link_name: str,
                 break
             
             all_records.extend(records)
-            print(f"[ZOHO FETCH] Page {page}: {len(records)} records (Total: {len(all_records)})")
+            print(f"[ZOHO FETCH] Page {page}: {len(records)} records")
             
-            time.sleep(0.5)  # Rate limiting
+            time.sleep(0.5)
         
         print(f"[ZOHO FETCH] ✓ Total fetched: {len(all_records)} records")
-        
-        # Trim to max_records if specified
-        if max_records and len(all_records) > max_records:
-            all_records = all_records[:max_records]
-        
         return all_records
         
     except Exception as e:
         print(f"[ZOHO FETCH] ✗ Error: {e}")
         raise
+
 
 def download_file_from_url(file_url: str, max_retries: int = 3) -> tuple:
     """Download file from URL with Zoho OAuth support"""
@@ -1079,7 +1070,7 @@ def process_extraction_job(job_id: str, config: Dict):
             "status": "failed",
             "completed_at": datetime.now().isoformat()
         })
-
+        
 # ============================================================
 # HELPER FUNCTIONS
 # ============================================================
@@ -1360,50 +1351,34 @@ async def preview_extraction(
     bank_field_name: Optional[str] = Form(None),
     bill_field_name: Optional[str] = Form(None),
     filter_criteria: Optional[str] = Form(None),
-    store_images: str = Form("false"),  # ✅ String instead of bool
-    fetch_all: str = Form("true"),      # ✅ String instead of bool
-    include_already_extracted: str = Form("false")  # ✅ String instead of bool
+    store_images: bool = Form(False)
 ):
     """
-    ✅ OPTIMIZED: Fast metadata loading with option to include/exclude already extracted records
+    ✅ OPTIMIZED: Fast metadata loading, excludes already extracted records
     """
     try:
         print(f"[PREVIEW] Fetching records from {report_link_name}...")
         
-        # ✅ Convert string booleans to actual booleans
-        fetch_all_bool = fetch_all.lower() in ('true', '1', 'yes')
-        include_already_extracted_bool = include_already_extracted.lower() in ('true', '1', 'yes')
+        # ✅ Get already extracted record IDs
+        already_extracted = get_already_extracted_record_ids(app_link_name, report_link_name)
         
-        # ✅ Fetch records - unlimited if fetch_all=True
-        max_records = None if fetch_all_bool else 1000
-        
+        # ✅ Only fetch metadata (fast!)
         records = fetch_zoho_records(
             app_link_name=app_link_name,
             report_link_name=report_link_name,
             criteria=filter_criteria,
-            max_records=max_records
+            max_records=1000
         )
         
-        total_fetched = len(records)
-        print(f"[PREVIEW] ✅ Fetched {total_fetched} total records from Zoho")
-        
-        # ✅ Optionally filter out already extracted records
-        already_extracted = set()
-        if not include_already_extracted_bool:
-            already_extracted = get_already_extracted_record_ids(app_link_name, report_link_name)
-            original_count = len(records)
-            records = [r for r in records if str(r.get("ID", "")) not in already_extracted]
-            filtered_count = original_count - len(records)
-            
-            if filtered_count > 0:
-                print(f"[PREVIEW] ✅ Filtered out {filtered_count} already extracted records")
-                print(f"[PREVIEW] ✅ Showing {len(records)} new/pending records")
-        else:
-            print(f"[PREVIEW] ⚠️ Including ALL records (even already extracted)")
+        # ✅ Filter out already extracted records
+        records = [r for r in records if str(r.get("ID", "")) not in already_extracted]
         
         total_count = len(records)
         
-        # ✅ Define helper functions
+        if already_extracted:
+            print(f"[PREVIEW] ✅ Filtered out {len(already_extracted)} already extracted records")
+            print(f"[PREVIEW] ✅ Showing {total_count} new/pending records")
+        
         def extract_name(record):
             for field in ["Name", "Student_Name", "Scholar_Name"]:
                 name_value = record.get(field)
@@ -1441,7 +1416,6 @@ async def preview_extraction(
             
             return None
         
-        # ✅ Initialize all_records list
         all_records = []
         
         # ✅ Quick metadata extraction (no image downloads!)
@@ -1463,15 +1437,13 @@ async def preview_extraction(
             }
             all_records.append(record_data)
         
-        print(f"[PREVIEW] ✅ Loaded {total_count} records instantly")
+        print(f"[PREVIEW] ✅ Loaded {total_count} pending records instantly")
         
         return JSONResponse(content={
             "success": True,
             "total_records": total_count,
-            "total_fetched_from_zoho": total_fetched,
             "already_extracted_count": len(already_extracted),
-            "included_already_extracted": include_already_extracted_bool,
-            "sample_records": all_records,
+            "sample_records": all_records[:1000],
             "filter_applied": filter_criteria is not None,
             "filter_criteria": filter_criteria,
             "fields": {
@@ -1480,10 +1452,8 @@ async def preview_extraction(
             },
             "estimated_cost": f"${total_count * 0.003:.4f}",
             "estimated_time_minutes": math.ceil(total_count * 3 / 60),
-            "message": f"✅ Ready to process {total_count} records instantly" + 
-                      (f" (excluded {len(already_extracted)} already extracted)" if not include_already_extracted_bool and already_extracted else ""),
-            "optimization": "Streaming mode - no wait time!",
-            "fetched_all_records": fetch_all_bool
+            "message": f"✅ Ready to process {total_count} new records instantly (excluded {len(already_extracted)} already extracted)",
+            "optimization": "Streaming mode - no wait time!"
         })
         
     except Exception as e:
@@ -1493,7 +1463,9 @@ async def preview_extraction(
         return JSONResponse(status_code=500, content={
             "success": False,
             "error": str(e)
-        })        
+        })
+
+
 # ============================================================
 # ✅ IMPROVED: START EXTRACTION with Duplicate Check
 # ============================================================
