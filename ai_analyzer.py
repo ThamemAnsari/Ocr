@@ -1,17 +1,19 @@
 """
-Enhanced AI Analyzer Module - COMPLETE FIXED VERSION
-- Gemini Vision for direct image analysis (FIXED - uses raw bytes)
-- Improved Ollama prompts with better models
-- OCR text cleaning for character errors
-- Better regex patterns for fallback
+Enhanced AI Analyzer Module - FIXED WITH IMAGE VALIDATION
+- Proper image validation before sending to Gemini
+- Automatic image optimization (resize, compress)
+- Better MIME type detection
 - Comprehensive error handling
 """
 import json
 import re
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple
 import os
 import time
 from dotenv import load_dotenv
+from PIL import Image
+import io
+
 load_dotenv()
 
 # Detect which AI service is available
@@ -68,6 +70,157 @@ GEMINI_MODEL = 'gemini-3-pro-preview'
 print(f"[AI Config] Selected Model: {OLLAMA_MODEL if OLLAMA_AVAILABLE else GEMINI_MODEL if USE_GEMINI else 'OpenAI GPT' if USE_OPENAI else 'None'}")
 
 
+def validate_and_optimize_image(file_content: bytes, filename: str) -> Tuple[bytes, str]:
+    """
+    Validate and optimize image for Gemini Vision
+    - Validates image can be opened
+    - Resizes if too large
+    - Converts to JPEG if needed
+    - Compresses if file size is too large
+    
+    Returns: (optimized_bytes, mime_type)
+    """
+    print(f"[IMAGE VALIDATION] Validating: {filename} ({len(file_content):,} bytes)")
+    
+    try:
+        # Try to open the image
+        img = Image.open(io.BytesIO(file_content))
+        
+        # Get original format and size
+        original_format = img.format
+        original_size = img.size
+        original_mode = img.mode
+        
+        print(f"[IMAGE VALIDATION]   Format: {original_format}, Size: {original_size}, Mode: {original_mode}")
+        
+        # Define limits (Gemini supports up to 4096x4096, but we'll be conservative)
+        MAX_DIMENSION = 3072
+        MAX_FILE_SIZE_MB = 4
+        TARGET_FILE_SIZE_MB = 2
+        
+        needs_optimization = False
+        
+        # Check if dimensions are too large
+        if max(original_size) > MAX_DIMENSION:
+            print(f"[IMAGE VALIDATION]   ⚠️ Image too large, will resize")
+            needs_optimization = True
+        
+        # Check if file size is too large
+        size_mb = len(file_content) / (1024 * 1024)
+        if size_mb > MAX_FILE_SIZE_MB:
+            print(f"[IMAGE VALIDATION]   ⚠️ File size {size_mb:.2f}MB too large, will compress")
+            needs_optimization = True
+        
+        # Convert RGBA to RGB if needed (JPEG doesn't support alpha)
+        if img.mode in ('RGBA', 'LA', 'P'):
+            print(f"[IMAGE VALIDATION]   Converting {img.mode} to RGB")
+            # Create white background
+            background = Image.new('RGB', img.size, (255, 255, 255))
+            if img.mode == 'P':
+                img = img.convert('RGBA')
+            background.paste(img, mask=img.split()[-1] if img.mode in ('RGBA', 'LA') else None)
+            img = background
+            needs_optimization = True
+        
+        # Optimize if needed
+        if needs_optimization:
+            # Calculate resize ratio
+            if max(original_size) > MAX_DIMENSION:
+                ratio = MAX_DIMENSION / max(original_size)
+                new_size = (int(original_size[0] * ratio), int(original_size[1] * ratio))
+                print(f"[IMAGE VALIDATION]   Resizing to: {new_size}")
+                img = img.resize(new_size, Image.Resampling.LANCZOS)
+            
+            # Convert to JPEG with progressive quality reduction
+            output = io.BytesIO()
+            quality = 95
+            
+            while quality >= 60:
+                output.seek(0)
+                output.truncate()
+                
+                img.save(output, format='JPEG', quality=quality, optimize=True)
+                
+                output_size_mb = output.tell() / (1024 * 1024)
+                
+                if output_size_mb <= TARGET_FILE_SIZE_MB or quality <= 60:
+                    break
+                
+                quality -= 5
+            
+            optimized_bytes = output.getvalue()
+            mime_type = "image/jpeg"
+            
+            print(f"[IMAGE VALIDATION]   ✓ Optimized: {len(optimized_bytes):,} bytes (quality: {quality})")
+            print(f"[IMAGE VALIDATION]   Size reduction: {len(file_content):,} → {len(optimized_bytes):,} bytes")
+            
+            return optimized_bytes, mime_type
+        
+        else:
+            # Image is fine, just detect MIME type
+            if original_format == 'PNG':
+                mime_type = "image/png"
+            elif original_format in ('JPEG', 'JPG'):
+                mime_type = "image/jpeg"
+            elif original_format == 'WEBP':
+                mime_type = "image/webp"
+            else:
+                # Convert unknown formats to JPEG
+                print(f"[IMAGE VALIDATION]   Converting {original_format} to JPEG")
+                output = io.BytesIO()
+                if img.mode != 'RGB':
+                    img = img.convert('RGB')
+                img.save(output, format='JPEG', quality=90, optimize=True)
+                return output.getvalue(), "image/jpeg"
+            
+            print(f"[IMAGE VALIDATION]   ✓ Image is valid, no optimization needed")
+            return file_content, mime_type
+    
+    except Exception as e:
+        print(f"[IMAGE VALIDATION]   ✗ Failed to validate image: {e}")
+        
+        # Check if file is actually an image by magic bytes
+        is_jpeg = file_content[:2] == b'\xff\xd8'
+        is_png = file_content[:4] == b'\x89PNG'
+        is_webp = len(file_content) > 12 and file_content[8:12] == b'WEBP'
+        
+        if not any([is_jpeg, is_png, is_webp]):
+            # Not a valid image format
+            print(f"[IMAGE VALIDATION]   ✗ File is NOT a valid image!")
+            print(f"[IMAGE VALIDATION]   First 20 bytes: {file_content[:20].hex()}")
+            
+            # Try to see if it's text (HTML/JSON error)
+            try:
+                text_preview = file_content[:200].decode('utf-8', errors='ignore')
+                if '<html' in text_preview.lower() or '<!doctype' in text_preview.lower():
+                    print(f"[IMAGE VALIDATION]   ✗ File is HTML, not an image!")
+                    print(f"[IMAGE VALIDATION]   Preview: {text_preview[:150]}")
+                    raise Exception(f"Downloaded file is HTML error page, not an image")
+                elif '{' in text_preview and ('"error"' in text_preview or '"message"' in text_preview):
+                    print(f"[IMAGE VALIDATION]   ✗ File is JSON error, not an image!")
+                    print(f"[IMAGE VALIDATION]   Preview: {text_preview[:150]}")
+                    raise Exception(f"Downloaded file is JSON error, not an image")
+            except UnicodeDecodeError:
+                pass
+            
+            raise Exception(f"File is not a valid image format. Cannot process.")
+        
+        # Detect MIME type from magic bytes as fallback
+        if is_png:
+            mime_type = "image/png"
+        elif is_jpeg:
+            mime_type = "image/jpeg"
+        elif is_webp:
+            mime_type = "image/webp"
+        else:
+            mime_type = "image/jpeg"
+        
+        print(f"[IMAGE VALIDATION]   ⚠️ Using fallback MIME type: {mime_type}")
+        print(f"[IMAGE VALIDATION]   ⚠️ Sending raw bytes without optimization")
+        
+        return file_content, mime_type
+
+
 def clean_ocr_text(text: str) -> str:
     """Fix common OCR character substitutions"""
     corrections = {
@@ -106,8 +259,7 @@ def validate_indian_account_number(account_num: str) -> bool:
 
 def analyze_bank_gemini_vision(file_content: bytes, filename: str) -> Dict[str, Any]:
     """
-    ✅ FIXED: Analyze bank passbook using Gemini Vision (NEW API)
-    Uses raw bytes directly - NO base64 encoding!
+    ✅ FIXED: Analyze bank passbook using Gemini Vision with image validation
     """
     if not USE_GEMINI:
         raise Exception("Gemini Vision not available - add GEMINI_API_KEY to .env")
@@ -117,14 +269,10 @@ def analyze_bank_gemini_vision(file_content: bytes, filename: str) -> Dict[str, 
     try:
         from google.genai import types
         
-        # Detect MIME type from file content
-        mime_type = "image/jpeg"
-        if file_content[:4] == b'\x89PNG':
-            mime_type = "image/png"
-        elif file_content[:2] == b'\xff\xd8':
-            mime_type = "image/jpeg"
+        # ✅ NEW: Validate and optimize image first
+        optimized_content, mime_type = validate_and_optimize_image(file_content, filename)
         
-        print(f"[GEMINI VISION] Format: {mime_type}, Size: {len(file_content)} bytes")
+        print(f"[GEMINI VISION] Sending to Gemini: {mime_type}, {len(optimized_content):,} bytes")
         
         prompt = """
 You are analyzing an Indian bank passbook image. Extract ALL visible details accurately.
@@ -152,12 +300,12 @@ Return ONLY this JSON:
 }
 """
         
-        # ✅ CORRECT: Use types.Part.from_bytes() with raw bytes
+        # ✅ Call Gemini with optimized image
         response = genai_client.models.generate_content(
             model=GEMINI_MODEL,
             contents=[
                 types.Part.from_bytes(
-                    data=file_content,  # Raw bytes, NO base64!
+                    data=optimized_content,
                     mime_type=mime_type
                 ),
                 prompt
@@ -190,7 +338,7 @@ Return ONLY this JSON:
 
 def analyze_bill_gemini_vision(file_content: bytes, filename: str) -> Dict[str, Any]:
     """
-    ✅ FIXED: Analyze bill using Gemini Vision (NEW API)
+    ✅ FIXED: Analyze bill using Gemini Vision with image validation
     """
     if not USE_GEMINI:
         raise Exception("Gemini Vision not available")
@@ -200,12 +348,10 @@ def analyze_bill_gemini_vision(file_content: bytes, filename: str) -> Dict[str, 
     try:
         from google.genai import types
         
-        # Detect MIME type
-        mime_type = "image/jpeg"
-        if file_content[:4] == b'\x89PNG':
-            mime_type = "image/png"
-        elif file_content[:2] == b'\xff\xd8':
-            mime_type = "image/jpeg"
+        # ✅ NEW: Validate and optimize image first
+        optimized_content, mime_type = validate_and_optimize_image(file_content, filename)
+        
+        print(f"[GEMINI VISION] Sending to Gemini: {mime_type}, {len(optimized_content):,} bytes")
         
         prompt = """
 Extract details from this Indian college fee receipt/bill.
@@ -234,12 +380,12 @@ Return ONLY JSON:
 }
 """
         
-        # ✅ Use raw bytes directly
+        # ✅ Call Gemini with optimized image
         response = genai_client.models.generate_content(
             model=GEMINI_MODEL,
             contents=[
                 types.Part.from_bytes(
-                    data=file_content,
+                    data=optimized_content,
                     mime_type=mime_type
                 ),
                 prompt
@@ -253,13 +399,12 @@ Return ONLY JSON:
         response_text = response.text.replace("```json", "").replace("```", "").strip()
         data = json.loads(response_text)
         
-        # ✅ FIX: Handle case where Gemini returns an array instead of object
+        # ✅ Handle different response types
         if isinstance(data, list):
             print(f"[GEMINI VISION] ⚠️ Received array response, taking first element")
             if len(data) > 0:
-                data = data[0]  # Take first element
+                data = data[0]
             else:
-                # Empty array, return null values
                 data = {
                     "student_name": None,
                     "college_name": None,
@@ -270,7 +415,6 @@ Return ONLY JSON:
                     "amount": None
                 }
         
-        # ✅ Ensure data is a dict before accessing
         if not isinstance(data, dict):
             print(f"[GEMINI VISION] ⚠️ Unexpected data type: {type(data)}")
             data = {
@@ -296,7 +440,8 @@ Return ONLY JSON:
         import traceback
         traceback.print_exc()
         raise
-        
+
+
 def extract_bank_details_from_markdown(markdown_text: str) -> dict:
     """Regex-based bank extraction (fallback)"""
     print(f"[MANUAL EXTRACTION] Parsing bank markdown...")
@@ -481,7 +626,7 @@ def analyze_bill_from_markdown(markdown_text: str) -> Dict[str, Any]:
 
 def analyze_generic_gemini_vision(file_content: bytes, filename: str, user_prompt: str) -> Dict[str, Any]:
     """
-    Generic document analysis using Gemini Vision with custom prompt
+    ✅ FIXED: Generic document analysis using Gemini Vision with image validation
     """
     if not USE_GEMINI:
         raise Exception("Gemini Vision not available - add GEMINI_API_KEY to .env")
@@ -492,16 +637,11 @@ def analyze_generic_gemini_vision(file_content: bytes, filename: str, user_promp
     try:
         from google.genai import types
         
-        # Detect MIME type
-        mime_type = "image/jpeg"
-        if file_content[:4] == b'\x89PNG':
-            mime_type = "image/png"
-        elif file_content[:2] == b'\xff\xd8':
-            mime_type = "image/jpeg"
+        # ✅ NEW: Validate and optimize image first
+        optimized_content, mime_type = validate_and_optimize_image(file_content, filename)
         
-        print(f"[GEMINI VISION] Format: {mime_type}, Size: {len(file_content)} bytes")
+        print(f"[GEMINI VISION] Sending to Gemini: {mime_type}, {len(optimized_content):,} bytes")
         
-        # Build the full prompt
         full_prompt = f"""
 You are a highly accurate OCR and data extraction AI. Analyze this document image and extract the information requested by the user.
 
@@ -519,12 +659,11 @@ INSTRUCTIONS:
 Return your response as a valid JSON object with the fields the user requested.
 """
         
-        # Call Gemini Vision
         response = genai_client.models.generate_content(
             model=GEMINI_MODEL,
             contents=[
                 types.Part.from_bytes(
-                    data=file_content,
+                    data=optimized_content,
                     mime_type=mime_type
                 ),
                 full_prompt
@@ -535,35 +674,29 @@ Return your response as a valid JSON object with the fields the user requested.
             )
         )
         
-        # Parse response
         response_text = response.text.replace("```json", "").replace("```", "").strip()
         data = json.loads(response_text)
         
-        # ✅ FIX: Handle different response types
+        # Handle different response types
         if isinstance(data, str):
-            # If Gemini returned a plain string, wrap it
             print(f"[GEMINI VISION] ⚠️ Received string response, wrapping in object")
             data = {"extracted_value": data}
         elif isinstance(data, list):
-            # If Gemini returned an array
             print(f"[GEMINI VISION] ⚠️ Received array response")
             if len(data) > 0:
                 if isinstance(data[0], dict):
-                    data = data[0]  # Take first object
+                    data = data[0]
                 else:
-                    data = {"extracted_values": data}  # Wrap array
+                    data = {"extracted_values": data}
             else:
                 data = {"extracted_values": []}
         elif isinstance(data, (int, float, bool)):
-            # If Gemini returned a primitive value
             print(f"[GEMINI VISION] ⚠️ Received primitive value, wrapping in object")
             data = {"extracted_value": data}
         elif not isinstance(data, dict):
-            # Unknown type, wrap it
             print(f"[GEMINI VISION] ⚠️ Unexpected type: {type(data)}, wrapping in object")
             data = {"extracted_value": str(data)}
         
-        # Ensure data is a dictionary
         if not isinstance(data, dict):
             data = {"error": "Invalid response format", "raw_response": str(data)}
         
