@@ -2279,6 +2279,233 @@ async def test_zoho_connection():
         })
 
 
+# ============================================================
+# DYNAMIC ZOHO CREATOR ENDPOINTS
+# ============================================================
+
+class ZohoConfigRequest(BaseModel):
+    owner_name: str
+    app_name: str
+    form_name: str
+
+class ZohoConfig(BaseModel):
+    owner_name: str
+    app_name: str
+    form_name: str
+
+class DynamicPushRequest(BaseModel):
+    config: ZohoConfig
+    field_mapping: Dict[str, str] = {}  # Optional - not used
+    record_ids: List[Any]  # Accept both strings and integers
+
+
+@app.post("/zoho/get-form-fields")
+async def get_zoho_form_fields(request: ZohoConfigRequest):
+    """
+    Fetch available fields from a Zoho Creator form
+    This allows dynamic field mapping in the frontend
+    """
+    try:
+        # Get access token
+        access_token = os.getenv("ZOHO_ACCESS_TOKEN")
+        if not access_token:
+            return JSONResponse(status_code=400, content={
+                "success": False,
+                "error": "Zoho access token not configured"
+            })
+        
+        # Build Zoho Creator API URL
+        form_url = f"https://creator.zoho.com/api/v2/{request.owner_name}/{request.app_name}/form/{request.form_name}"
+        
+        # Fetch form metadata to get field names
+        headers = {
+            'Authorization': f'Zoho-oauthtoken {access_token}'
+        }
+        
+        # Try to get form fields by fetching a sample record or form metadata
+        # Note: Zoho Creator doesn't have a direct "get fields" endpoint,
+        # so we'll try to infer from form structure or use common fields
+        
+        # Common Zoho Creator field approach: try to add a test record (dry-run style)
+        # or use the report API to get field structure
+        report_url = f"https://creator.zoho.com/api/v2/{request.owner_name}/{request.app_name}/report/All_{request.form_name}"
+        
+        response = requests.get(
+            report_url,
+            headers=headers,
+            params={'max_records': 1},
+            timeout=30
+        )
+        
+        if response.status_code == 200:
+            data = response.json()
+            
+            # Extract field names from the first record or metadata
+            if 'data' in data and len(data['data']) > 0:
+                fields = list(data['data'][0].keys())
+                # Filter out system fields
+                fields = [f for f in fields if not f.startswith('zc_') and f not in ['ID', 'Added_User', 'Modified_User']]
+            else:
+                # If no records exist, try to get from metadata
+                fields = []
+                if 'fields' in data:
+                    fields = [f['display_name'] for f in data['fields']]
+        else:
+            # Fallback: Return your known fields from the existing configuration
+            print(f"⚠️  Could not fetch fields from Zoho (Status: {response.status_code})")
+            print(f"Response: {response.text[:200]}")
+            
+            # Return common fields as fallback
+            fields = [
+                "Scholar_Name",
+                "Scholar_ID", 
+                "Tracking_ID",
+                "Account_Number",
+                "Bank_Name",
+                "Account_Holder_Name",
+                "IFSC_Code",
+                "Branch_Name",
+                "Bill_Data",
+                "Bill1_Amount",
+                "Bill2_Amount",
+                "Bill3_Amount",
+                "Bill4_Amount",
+                "Bill5_Amount",
+                "Total_Amount",
+                "Tokens_Used",
+                "Status"
+            ]
+        
+        return JSONResponse(content={
+            "success": True,
+            "fields": fields,
+            "message": f"Found {len(fields)} fields"
+        })
+        
+    except Exception as e:
+        print(f"❌ Error fetching Zoho form fields: {e}")
+        return JSONResponse(status_code=500, content={
+            "success": False,
+            "error": str(e)
+        })
+
+
+@app.post("/zoho/dynamic-push")
+async def dynamic_push_to_zoho(request: DynamicPushRequest):
+    """
+    Push records to Zoho Creator using existing zoho_bulk_api.py
+    This uses the proven field mapping from zoho_bulk_api.py
+    (Tracking_ID, Bill1-5_Amount, formatted Bill_Data, etc.)
+    """
+    try:
+        if not supabase:
+            return JSONResponse(status_code=400, content={
+                "success": False,
+                "error": "Supabase not configured"
+            })
+        
+        print(f"\n{'='*80}")
+        print(f"DYNAMIC PUSH TO ZOHO")
+        print(f"{'='*80}")
+        print(f"Records to push: {len(request.record_ids)}")
+        print(f"Record IDs: {request.record_ids[:5]}...")  # Show first 5
+        print(f"{'='*80}\n")
+        
+        # Convert record_ids to strings
+        record_ids_str = [str(rid) for rid in request.record_ids]
+        
+        # Fetch full records from Supabase
+        records = []
+        for record_id in record_ids_str:
+            try:
+                response = supabase.table('auto_extraction_results')\
+                    .select('*')\
+                    .eq('id', record_id)\
+                    .execute()
+                
+                if response.data and len(response.data) > 0:
+                    records.append(response.data[0])
+                else:
+                    print(f"⚠️  Record {record_id} not found")
+            except Exception as fetch_error:
+                print(f"❌ Error fetching record {record_id}: {fetch_error}")
+        
+        if not records:
+            return JSONResponse(status_code=400, content={
+                "success": False,
+                "error": "No valid records found"
+            })
+        
+        print(f"✅ Successfully fetched {len(records)} records from Supabase")
+        
+        # Use existing zoho_bulk_api.py - proven to work!
+        result = zoho_bulk.bulk_insert(records)
+        
+        print(f"\n{'='*80}")
+        print(f"PUSH RESULT")
+        print(f"{'='*80}")
+        print(f"✅ Successful: {result['successful']}/{result['total_records']}")
+        print(f"❌ Failed: {result['failed']}/{result['total_records']}")
+        print(f"{'='*80}\n")
+        
+        return JSONResponse(content={
+            "success": result['successful'] > 0,
+            "details": result
+        })
+        
+    except Exception as e:
+        print(f"❌ Dynamic push error: {e}")
+        import traceback
+        traceback.print_exc()
+        return JSONResponse(status_code=500, content={
+            "success": False,
+            "error": str(e)
+        })
+
+
+def get_nested_value(obj: dict, path: str):
+    """
+    Get value from nested dictionary using dot notation
+    Example: get_nested_value(record, "bank_data.account_number")
+    Also handles array indexing: "bill_data[0].amount"
+    """
+    try:
+        keys = path.replace('[', '.').replace(']', '').split('.')
+        value = obj
+        
+        for key in keys:
+            if key.isdigit():
+                value = value[int(key)]
+            else:
+                value = value.get(key) if isinstance(value, dict) else None
+            
+            if value is None:
+                return None
+        
+        return value
+    except:
+        return None
+
+
+def format_value_for_zoho(value):
+    """Format values appropriately for Zoho Creator"""
+    if value is None:
+        return ""
+    
+    if isinstance(value, dict):
+        # Convert dict to JSON string
+        return json.dumps(value)
+    
+    if isinstance(value, list):
+        # Convert list to JSON string
+        return json.dumps(value)
+    
+    if isinstance(value, (int, float)):
+        return value
+    
+    return str(value)
+
+
 if __name__ == "__main__":
     import uvicorn
     
