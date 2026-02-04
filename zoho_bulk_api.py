@@ -50,6 +50,7 @@ class ZohoBulkAPI:
     def format_record_for_zoho_form(self, record: Dict) -> Dict:
         """
         Format record to match YOUR Zoho Creator form fields
+        Handles MULTIPLE bills correctly!
         """
         bill_data = record.get('bill_data', {})
         bank_data = record.get('bank_data', {})
@@ -67,29 +68,80 @@ class ZohoBulkAPI:
             except:
                 bank_data = {}
         
+        # Convert bill_data to array format (handle both single object and array)
+        bill_data_array = []
+        if isinstance(bill_data, list):
+            bill_data_array = bill_data
+        elif isinstance(bill_data, dict) and bill_data:
+            bill_data_array = [bill_data]
+        
+        # Format bill data as readable text (matching frontend format)
+        def format_bill_text(bills):
+            if not bills:
+                return ""
+            
+            formatted_parts = []
+            for idx, bill in enumerate(bills):
+                prefix = f"Bill {idx + 1}: " if len(bills) > 1 else ""
+                part = (
+                    f"{prefix}"
+                    f"Student: {bill.get('student_name', 'N/A')} | "
+                    f"College: {bill.get('college_name', 'N/A')} | "
+                    f"Receipt: {bill.get('receipt_number', 'N/A')} | "
+                    f"Roll: {bill.get('roll_number', 'N/A')} | "
+                    f"Class: {bill.get('class_course', 'N/A')} | "
+                    f"Date: {bill.get('bill_date', 'N/A')} | "
+                    f"Amount: ₹{bill.get('amount', 0)}"
+                )
+                formatted_parts.append(part)
+            
+            return " || ".join(formatted_parts)
+        
+        # Extract individual bill amounts
+        bill1_amount = float(bill_data_array[0].get('amount', 0)) if len(bill_data_array) > 0 else 0
+        bill2_amount = float(bill_data_array[1].get('amount', 0)) if len(bill_data_array) > 1 else 0
+        bill3_amount = float(bill_data_array[2].get('amount', 0)) if len(bill_data_array) > 2 else 0
+        bill4_amount = float(bill_data_array[3].get('amount', 0)) if len(bill_data_array) > 3 else 0
+        bill5_amount = float(bill_data_array[4].get('amount', 0)) if len(bill_data_array) > 4 else 0
+        
+        # Get scholar info (prefer from first bill)
+        scholar_name = (
+            record.get('Scholar_Name') or 
+            record.get('student_name') or 
+            (bill_data_array[0].get('student_name') if bill_data_array else '') or 
+            ''
+        )
+        
+        scholar_id = (
+            record.get('Scholar_ID') or 
+            record.get('scholar_id') or 
+            (bill_data_array[0].get('scholar_id') if bill_data_array else '') or 
+            ''
+        )
+        
         # Map to YOUR form fields
         return {
-            "Scholar_Name": record.get('student_name') or bill_data.get('student_name') or "",
-            "Scholar_ID": record.get('scholar_id') or "",
-            "Account_No": bank_data.get('account_number') or "",
-            "Total_Extraction": record.get('tokens_used') or 0,
+            "Scholar_Name": scholar_name,
+            "Scholar_ID": scholar_id,
+            "Tracking_ID": record.get('Tracking_id', ''),  # ✅ NOW INCLUDED!
+            "Account_No": bank_data.get('account_number', ''),
+            "Total_Extraction": record.get('tokens_used', 0),
             "Status": record.get('status', 'completed'),
-            "Amount": float(bill_data.get('amount') or 0),
-            "Bank_Name": bank_data.get('bank_name') or "",
-            "Holder_Name": bank_data.get('account_holder_name') or "",
-            "IFSC_Code": bank_data.get('ifsc_code') or "",
-            "Branch_Name": bank_data.get('branch_name') or "",
+            "Amount": bill1_amount,  # Primary amount (first bill)
+            "Bank_Name": bank_data.get('bank_name', ''),
+            "Holder_Name": bank_data.get('account_holder_name', ''),
+            "IFSC_Code": bank_data.get('ifsc_code', ''),
+            "Branch_Name": bank_data.get('branch_name', ''),
             
-            # Store full bill data as JSON string
-            "Bill_Data": json.dumps(bill_data) if bill_data else "",
+            # Store formatted bill data as readable text (like in UI)
+            "Bill_Data": format_bill_text(bill_data_array),
             
-            # Individual bill amounts
-            "Bill1_Amount": float(bill_data.get('amount') or 0),  # Primary amount
-            "Bill2_Amount": 0,  # Placeholder for future bills
-            "Bill3_Amount": 0,
-            "Bill4_Amount": 0,
-            "Bill5_Amount": 0,
-            "Bill6_Amount": 0,
+            # Individual bill amounts (supports up to 5 bills)
+            "Bill1_Amount": bill1_amount,
+            "Bill2_Amount": bill2_amount,
+            "Bill3_Amount": bill3_amount,
+            "Bill4_Amount": bill4_amount,
+            "Bill5_Amount": bill5_amount,
         }
     
     def push_single_record(self, record: Dict) -> Dict:

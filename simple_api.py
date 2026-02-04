@@ -1,16 +1,18 @@
 """
-OCR API - COMPLETE VERSION with Auto-Extract
+OCR API - COMPLETE VERSION with Auto-Extract + Authentication
 ✅ Gemini Vision OCR
 ✅ Auto-extraction with job tracking
 ✅ Multi-token OAuth support
 ✅ Supabase integration
+✅ Authentik authentication
 """
 
-from fastapi import FastAPI, File, UploadFile, Form
+from fastapi import FastAPI, File, UploadFile, Form, Depends, HTTPException, status, Request, Response
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from typing import Optional, List, Dict, Any
+from pydantic import BaseModel
 from zoho_bulk_api import ZohoBulkAPI
 import tempfile 
 import os
@@ -26,20 +28,61 @@ import cv2
 import numpy as np
 from PIL import Image
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 import time
 import threading
 import math
 from functools import wraps
 from database import log_processing, get_usage_stats, get_all_logs, delete_log
+import secrets
+import httpx
 
 load_dotenv()
 
-app = FastAPI(title="OCR API - Complete with Auto-Extract")
+# ============================================================
+# AUTHENTICATION CONFIGURATION
+# ============================================================
+
+AUTHENTIK_URL = os.getenv("AUTHENTIK_URL", "https://authentik.teameverest.ngo")
+AUTHENTIK_API_TOKEN = os.getenv("AUTHENTIK_API_TOKEN", "")
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
+SECRET_KEY = os.getenv("SECRET_KEY", secrets.token_urlsafe(32))
+
+# In-memory session storage (use Redis in production)
+sessions = {}
+
+# ============================================================
+# AUTHENTICATION MODELS
+# ============================================================
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+class User(BaseModel):
+    id: str
+    username: str
+    email: str
+    name: str
+    groups: List[str] = []
+    is_admin: bool = False
+    user_type: Optional[str] = None
+    avatar: Optional[str] = None
+
+class LoginResponse(BaseModel):
+    success: bool
+    message: str
+    user: Optional[User] = None
+
+# ============================================================
+# FASTAPI APP INITIALIZATION
+# ============================================================
+
+app = FastAPI(title="OCR API - Complete with Auto-Extract + Auth")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[FRONTEND_URL, "*"],  # Update this in production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -125,6 +168,74 @@ current_read_index = 0
 current_create_index = 0
 
 print(f"[TOKENS] Loaded {len(ZOHO_TOKENS)} tokens")
+
+# ============================================================
+# AUTHENTICATION HELPER FUNCTIONS
+# ============================================================
+
+def create_session_token() -> str:
+    """Create a secure session token"""
+    return secrets.token_urlsafe(32)
+
+async def find_authentik_user(username: str) -> Optional[Dict]:
+    """Find user in Authentik by username"""
+    if not AUTHENTIK_API_TOKEN:
+        return None
+    
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(
+                f"{AUTHENTIK_URL}/api/v3/core/users/",
+                headers={"Authorization": f"Bearer {AUTHENTIK_API_TOKEN}"},
+                params={"username": username},
+                timeout=10.0
+            )
+            response.raise_for_status()
+            data = response.json()
+            
+            if data.get("results") and len(data["results"]) > 0:
+                return data["results"][0]
+            return None
+        except Exception as e:
+            print(f"Error finding user: {e}")
+            return None
+
+def get_user_type(groups: List[Dict]) -> Optional[str]:
+    """Determine user type from groups"""
+    group_names = [g.get("name", "") for g in groups]
+    
+    if "ECR Student" in group_names:
+        return "ecr_student"
+    elif "ICM Student" in group_names:
+        return "icm_student"
+    elif "IATC Admin" in group_names:
+        return "admin"
+    
+    return None
+
+async def get_current_user(request: Request) -> Optional[User]:
+    """Dependency to get current authenticated user (optional)"""
+    session_token = request.cookies.get("session_token")
+    
+    if not session_token or session_token not in sessions:
+        return None
+    
+    session = sessions[session_token]
+    if datetime.now() > session["expires_at"]:
+        del sessions[session_token]
+        return None
+    
+    return User(**session["user"])
+
+async def require_auth(request: Request) -> User:
+    """Dependency to require authentication"""
+    user = await get_current_user(request)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated"
+        )
+    return user
 
 # ============================================================
 # TOKEN MANAGEMENT
@@ -808,27 +919,22 @@ def process_extraction_job(job_id: str, config: Dict):
         
         def extract_scholar_id(record):
             """Extract Actual_Scholar_ID from record"""
-            # Try exact field name first
             field_value = record.get("Actual_Scholar_ID")
             
-            # Try alternative field names
             if not field_value:
                 field_value = record.get("Scholar_ID") or record.get("ScholarID")
             
             if not field_value:
                 return None
             
-            # Handle string value
             if isinstance(field_value, str):
                 return field_value.strip() if field_value.strip() else None
             
-            # Handle dict/lookup value
             if isinstance(field_value, dict):
                 display_value = field_value.get("zc_display_value")
                 if display_value:
                     return display_value.strip()
                 
-                # Try ID field
                 id_value = field_value.get("ID")
                 if id_value:
                     return str(id_value)
@@ -837,27 +943,22 @@ def process_extraction_job(job_id: str, config: Dict):
         
         def extract_tracking_id(record):
             """Extract Tracking_ID from record"""
-            # Try exact field name first
             field_value = record.get("Tracking_ID")
             
-            # Try alternative field names
             if not field_value:
                 field_value = record.get("TrackingID") or record.get("Tracking_Id")
             
             if not field_value:
                 return None
             
-            # Handle string value
             if isinstance(field_value, str):
                 return field_value.strip() if field_value.strip() else None
             
-            # Handle dict/lookup value
             if isinstance(field_value, dict):
                 display_value = field_value.get("zc_display_value")
                 if display_value:
                     return display_value.strip()
                 
-                # Try ID field
                 id_value = field_value.get("ID")
                 if id_value:
                     return str(id_value)
@@ -870,12 +971,11 @@ def process_extraction_job(job_id: str, config: Dict):
             
             record_id = str(record.get("ID"))
             student_name = extract_student_name(record)
-            scholar_id = extract_scholar_id(record)  # ✅ Extract Scholar ID
-            tracking_id = extract_tracking_id(record)  # ✅ Extract Tracking ID
+            scholar_id = extract_scholar_id(record)
+            tracking_id = extract_tracking_id(record)
             
             print(f"\n[AUTO EXTRACT] [{idx}/{len(records)}] {student_name} (ID: {record_id})")
             
-            # ✅ Log extracted IDs
             if scholar_id:
                 print(f"[AUTO EXTRACT]   📋 Scholar ID: {scholar_id}")
             if tracking_id:
@@ -1001,8 +1101,8 @@ def process_extraction_job(job_id: str, config: Dict):
                         app_link_name=config['app_link_name'],
                         report_link_name=config['report_link_name'],
                         student_name=student_name,
-                        scholar_id=scholar_id,  # ✅ NEW
-                        tracking_id=tracking_id,  # ✅ NEW
+                        scholar_id=scholar_id,
+                        tracking_id=tracking_id,
                         bank_image_supabase=bank_image_url_supabase,
                         bill_image_supabase=bill_images_supabase,
                         bank_data=bank_data,
@@ -1053,6 +1153,247 @@ def process_extraction_job(job_id: str, config: Dict):
             "status": "failed",
             "completed_at": datetime.now().isoformat()
         })
+
+# ============================================================
+# AUTHENTICATION ENDPOINTS
+# ============================================================
+
+@app.post("/auth/login", response_model=LoginResponse)
+async def login(login_data: LoginRequest, response: Response):
+    """Authenticate user with Authentik"""
+    try:
+        username = login_data.username
+        password = login_data.password
+
+        if not username or '@' in username:
+            return LoginResponse(
+                success=False,
+                message="Please login with your username, not email address"
+            )
+
+        if not password:
+            return LoginResponse(
+                success=False,
+                message="Password is required"
+            )
+
+        print(f"\n🔐 LOGIN ATTEMPT for user: {username}")
+
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+            # Step 1: Initialize authentication flow
+            flow_response = await client.post(
+                f"{AUTHENTIK_URL}/api/v3/flows/executor/default-authentication-flow/",
+                json={}
+            )
+            
+            print(f"📥 Step 1 Status: {flow_response.status_code}")
+            cookies = flow_response.cookies
+            
+            # Step 2: Submit username
+            id_response = await client.post(
+                f"{AUTHENTIK_URL}/api/v3/flows/executor/default-authentication-flow/",
+                json={"uid_field": username},
+                cookies=cookies
+            )
+            
+            print(f"📥 Step 2 Final Status: {id_response.status_code}")
+            
+            if id_response.cookies:
+                cookies.update(id_response.cookies)
+            
+            try:
+                id_data = id_response.json()
+                print(f"📥 Step 2 Component: {id_data.get('component')}")
+            except Exception as e:
+                print(f"❌ JSON parse error at Step 2: {e}")
+                return LoginResponse(
+                    success=False,
+                    message="Invalid username. Please check and try again."
+                )
+            
+            if id_data.get("component") != "ak-stage-password":
+                print(f"❌ Invalid username - got component: {id_data.get('component')}")
+                return LoginResponse(
+                    success=False,
+                    message="Invalid username. Please check and try again."
+                )
+            
+            # Step 3: Submit password
+            password_response = await client.post(
+                f"{AUTHENTIK_URL}/api/v3/flows/executor/default-authentication-flow/",
+                json={"password": password},
+                cookies=cookies
+            )
+            
+            print(f"📥 Step 3 Final Status: {password_response.status_code}")
+            
+            try:
+                password_data = password_response.json()
+            except Exception as e:
+                print(f"❌ JSON parse error at Step 3: {e}")
+                return LoginResponse(
+                    success=False,
+                    message="Authentication failed"
+                )
+            
+            component = password_data.get("component")
+            print(f"🔍 Password response component: {component}")
+            
+            # Step 4: Handle authentication result
+            if component == "xak-flow-redirect":
+                # ✅ SUCCESS
+                authentik_user = await find_authentik_user(username)
+                
+                if not authentik_user:
+                    print("❌ Could not find Authentik user")
+                    return LoginResponse(
+                        success=False,
+                        message="User not found in system"
+                    )
+                
+                user_groups = authentik_user.get("groups_obj", authentik_user.get("groups", []))
+                user_type = get_user_type(user_groups)
+                is_admin = any(g.get("name") == "IATC Admin" for g in user_groups)
+                group_names = [g.get("name") for g in user_groups]
+                
+                if is_admin:
+                    print("👑 ADMIN LOGIN DETECTED")
+                
+                print(f"👥 User Type: {user_type}")
+                print(f"👥 User Groups: {', '.join(group_names)}")
+                print("✅ Login successful")
+                
+                user = User(
+                    id=str(authentik_user.get("pk")),
+                    username=authentik_user.get("username"),
+                    email=authentik_user.get("email", ""),
+                    name=authentik_user.get("name", authentik_user.get("username")),
+                    groups=group_names,
+                    is_admin=is_admin,
+                    user_type=user_type,
+                    avatar=authentik_user.get("avatar", "")
+                )
+                
+                session_token = create_session_token()
+                sessions[session_token] = {
+                    "user": user.model_dump(),
+                    "created_at": datetime.now(),
+                    "expires_at": datetime.now() + timedelta(hours=24),
+                    "login_time": datetime.now().isoformat(),
+                    "auth_method": "password"
+                }
+                
+                response.set_cookie(
+                    key="session_token",
+                    value=session_token,
+                    httponly=True,
+                    secure=False,
+                    samesite="lax",
+                    max_age=86400
+                )
+                
+                print(f"✅ Session created for {username}")
+                print("=" * 50 + "\n")
+                
+                return LoginResponse(
+                    success=True,
+                    message="Authentication successful",
+                    user=user
+                )
+                
+            elif component == "ak-stage-identification":
+                print("❌ Invalid username (detected at password stage)")
+                return LoginResponse(
+                    success=False,
+                    message="Invalid username. Please check and try again."
+                )
+                
+            elif component == "ak-stage-password":
+                print("❌ Invalid password")
+                return LoginResponse(
+                    success=False,
+                    message="Invalid password. Please try again."
+                )
+                
+            else:
+                print(f"❌ Unexpected component: {component}")
+                return LoginResponse(
+                    success=False,
+                    message="Authentication failed. Please try again."
+                )
+                
+    except httpx.ConnectError:
+        print("❌ Connection error to Authentik")
+        return LoginResponse(
+            success=False,
+            message="Authentication service unavailable"
+        )
+    except Exception as e:
+        print(f"❌ Authentication error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return LoginResponse(
+            success=False,
+            message="Authentication failed"
+        )
+
+@app.get("/auth/me", response_model=User)
+async def get_me(current_user: User = Depends(require_auth)):
+    """Get current user information"""
+    return current_user
+
+@app.post("/auth/logout")
+async def logout(request: Request, response: Response):
+    """Logout user and clear session"""
+    session_token = request.cookies.get("session_token")
+    
+    if session_token and session_token in sessions:
+        user = sessions[session_token].get("user", {})
+        print(f"👋 User logged out: {user.get('username')}")
+        del sessions[session_token]
+    
+    response.delete_cookie("session_token")
+    
+    return {"success": True, "message": "Logged out successfully"}
+
+@app.get("/auth/refresh")
+async def refresh_token(request: Request):
+    """Refresh session expiry"""
+    session_token = request.cookies.get("session_token")
+    
+    if not session_token or session_token not in sessions:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated"
+        )
+    
+    session = sessions[session_token]
+    session["expires_at"] = datetime.now() + timedelta(hours=24)
+    
+    return {"success": True, "message": "Session refreshed"}
+
+@app.get("/auth/sessions")
+async def get_active_sessions(current_user: User = Depends(require_auth)):
+    """Get active session count (admin only)"""
+    if not current_user.is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin access required"
+        )
+    
+    return {
+        "success": True,
+        "active_sessions": len(sessions),
+        "sessions": [
+            {
+                "username": s["user"]["username"],
+                "created_at": s["created_at"].isoformat(),
+                "expires_at": s["expires_at"].isoformat()
+            }
+            for s in sessions.values()
+        ]
+    }
+
 # ============================================================
 # API ENDPOINTS
 # ============================================================
@@ -1060,8 +1401,8 @@ def process_extraction_job(job_id: str, config: Dict):
 @app.get("/")
 async def root():
     return {
-        "service": "OCR API - Complete with Auto-Extract",
-        "version": "6.0 - MERGED",
+        "service": "OCR API - Complete with Auto-Extract + Auth",
+        "version": "7.0 - WITH AUTH",
         "features": [
             "✅ Gemini Vision OCR",
             "✅ Auto-extraction with job tracking",
@@ -1069,12 +1410,18 @@ async def root():
             "✅ Supabase integration",
             "✅ PDF support",
             "✅ Bank & Bill extraction",
-            "✅ Batch processing"
+            "✅ Batch processing",
+            "✅ Authentik authentication"
         ],
         "supabase_status": "✅ Connected" if supabase else "❌ Not configured",
         "gemini_vision_status": "✅ Available" if USE_GEMINI else "❌ Not configured",
+        "authentication_status": "✅ Enabled" if AUTHENTIK_URL and AUTHENTIK_API_TOKEN else "❌ Not configured",
         "tokens_configured": len(ZOHO_TOKENS),
         "endpoints": {
+            "POST /auth/login": "Login with username/password",
+            "GET /auth/me": "Get current user info",
+            "POST /auth/logout": "Logout current session",
+            "GET /auth/refresh": "Refresh session token",
             "POST /ocr/bank": "Process bank passbook",
             "POST /ocr/bill": "Process college bill",
             "POST /ocr/auto-extract/fetch-fields": "Fetch report fields",
@@ -1090,6 +1437,7 @@ async def root():
 
 @app.post("/ocr/bank")
 async def process_bank_passbook(
+    request: Request,
     files: List[UploadFile] = File(default=[]),
     file: Optional[UploadFile] = File(None),
     File_upload_Bank: Optional[UploadFile] = File(None),
@@ -1099,11 +1447,16 @@ async def process_bank_passbook(
     student_name: Optional[str] = Form(None)
 ):
     """Process bank passbook - supports single or multiple files"""
+    # Optional authentication - get user if logged in
+    current_user = await get_current_user(request)
+    user_info = current_user.username if current_user else "anonymous"
+    
     try:
         print(f"\n{'='*80}")
         print(f"[BANK OCR] Processing bank passbook(s)")
         if student_name:
             print(f"[BANK OCR] Student: {student_name}")
+        print(f"[BANK OCR] User: {user_info}")
         print(f"{'='*80}")
         
         # Collect files
@@ -1215,6 +1568,7 @@ async def process_bank_passbook(
 
 @app.post("/ocr/bill")
 async def process_bill(
+    request: Request,
     files: List[UploadFile] = File(default=[]),
     file: Optional[UploadFile] = File(None),
     file_url: Optional[str] = Form(None),
@@ -1222,11 +1576,16 @@ async def process_bill(
     student_name: Optional[str] = Form(None)
 ):
     """Process college bill - supports single or multiple files"""
+    # Optional authentication
+    current_user = await get_current_user(request)
+    user_info = current_user.username if current_user else "anonymous"
+    
     try:
         print(f"\n{'='*80}")
         print(f"[BILL OCR] Processing bill(s)")
         if student_name:
             print(f"[BILL OCR] Student: {student_name}")
+        print(f"[BILL OCR] User: {user_info}")
         print(f"{'='*80}")
         
         # Collect files
@@ -1350,13 +1709,6 @@ async def bulk_push_selected_to_zoho(request: dict):
         print(f"PUSHING {len(records)} SELECTED RECORDS TO ZOHO")
         print(f"{'='*80}\n")
         
-        # ✅ Debug: Print first record structure
-        if len(records) > 0:
-            print("[DEBUG] First record structure:")
-            print(json.dumps(records[0], indent=2, default=str))
-            print("\n[DEBUG] Bill data type:", type(records[0].get('bill_data')))
-            print("[DEBUG] Bill data value:", records[0].get('bill_data'))
-        
         # Validate records
         if not isinstance(records, list):
             return JSONResponse(
@@ -1395,8 +1747,9 @@ async def bulk_push_selected_to_zoho(request: dict):
             status_code=500,
             content={"success": False, "error": str(e)}
         )
+
 # ============================================================
-# ✅ NEW: AUTO-EXTRACT ENDPOINTS
+# ✅ AUTO-EXTRACT ENDPOINTS
 # ============================================================
 
 @app.post("/ocr/auto-extract/fetch-fields")
@@ -1408,7 +1761,6 @@ async def fetch_report_fields(
     try:
         print(f"[FETCH FIELDS] Fetching schema for {report_link_name}...")
         
-        # Fetch just 1 record to get field schema
         records = fetch_zoho_records(
             app_link_name=app_link_name,
             report_link_name=report_link_name,
@@ -1485,7 +1837,7 @@ async def preview_extraction(
         include_already_extracted_bool = include_already_extracted.lower() in ('true', '1', 'yes')
 
         if fetch_all_bool:
-            max_records = min(max_records_limit, 10000)  # Hard cap at 10k
+            max_records = min(max_records_limit, 10000)
             print(f"[PREVIEW] ⚠️ Fetch all enabled - limiting to {max_records} records for safety")
         else:
             max_records = 1000
@@ -1494,12 +1846,11 @@ async def preview_extraction(
             app_link_name=app_link_name,
             report_link_name=report_link_name,
             criteria=filter_criteria,
-            max_records=max_records  # ✅ Always has a limit now
+            max_records=max_records
         )
         
         total_fetched = len(records)
         
-        # Filter out already extracted
         already_extracted = set()
         if not include_already_extracted_bool:
             already_extracted = get_already_extracted_record_ids(app_link_name, report_link_name)
@@ -1588,17 +1939,15 @@ async def start_extraction(
         })
     
     try:
-        # Parse selected IDs
         selected_ids = []
         if selected_record_ids:
             try:
                 raw_ids = json.loads(selected_record_ids)
-                selected_ids = list(set([str(rid) for rid in raw_ids]))  # Deduplicate
+                selected_ids = list(set([str(rid) for rid in raw_ids]))
                 print(f"[START] Selected {len(selected_ids)} unique records")
             except Exception as parse_error:
                 print(f"[START] Failed to parse IDs: {parse_error}")
         
-        # Filter out already extracted
         already_extracted = get_already_extracted_record_ids(app_link_name, report_link_name)
         
         if selected_ids:
@@ -1610,7 +1959,6 @@ async def start_extraction(
                     "error": "All selected records have already been extracted"
                 })
         
-        # Check for duplicate jobs
         if selected_ids:
             active_job = check_active_jobs_for_records(selected_ids)
             if active_job:
@@ -1632,7 +1980,6 @@ async def start_extraction(
             "selected_record_ids": selected_ids
         }
         
-        # Save job
         supabase.table("auto_extraction_jobs").insert({
             "job_id": job_id,
             "app_link_name": app_link_name,
@@ -1643,7 +1990,6 @@ async def start_extraction(
             "status": "pending"
         }).execute()
         
-        # Start background thread
         thread = threading.Thread(
             target=process_extraction_job,
             args=(job_id, config)
@@ -1865,16 +2211,18 @@ async def get_token_stats():
 async def health():
     return {
         "status": "healthy",
-        "service": "OCR API - Complete with Auto-Extract",
-        "version": "6.0 - MERGED",
+        "service": "OCR API - Complete with Auto-Extract + Auth",
+        "version": "7.0 - WITH AUTH",
         "gemini_vision": "enabled" if USE_GEMINI else "disabled",
         "supabase": "connected" if supabase else "not configured",
-        "tokens_configured": len(ZOHO_TOKENS)
+        "authentication": "enabled" if AUTHENTIK_URL and AUTHENTIK_API_TOKEN else "not configured",
+        "tokens_configured": len(ZOHO_TOKENS),
+        "active_sessions": len(sessions)
     }
 
 
 # ============================================================
-# ZOHO SYNC ENDPOINTS (from original simple_api.py)
+# ZOHO SYNC ENDPOINTS
 # ============================================================
 
 @app.post("/sync/bulk-push-to-zoho")
@@ -1937,12 +2285,13 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     
     print("="*80)
-    print("OCR API - COMPLETE WITH AUTO-EXTRACT")
+    print("OCR API - COMPLETE WITH AUTO-EXTRACT + AUTHENTICATION")
     print("="*80)
     print(f"✅ Gemini Vision: {'ENABLED' if USE_GEMINI else 'DISABLED'}")
     print(f"✅ Supabase: {'CONNECTED' if supabase else 'NOT CONFIGURED'}")
     print(f"✅ Multi-token OAuth: {len(ZOHO_TOKENS)} tokens")
     print(f"✅ Auto-extraction: {'ENABLED' if supabase else 'DISABLED (needs Supabase)'}")
+    print(f"✅ Authentication: {'ENABLED' if AUTHENTIK_URL and AUTHENTIK_API_TOKEN else 'DISABLED'}")
     print("="*80)
     print(f"\nStarting server on http://0.0.0.0:{port}")
     print("="*80 + "\n")
