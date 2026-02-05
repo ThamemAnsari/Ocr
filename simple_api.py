@@ -117,7 +117,7 @@ except ImportError:
 # ============================================================
 
 ZOHO_TOKENS = [
-    # READ TOKENS
+    # READ TOKENS - Primary Pool (1-2)
     {
         "name": "Token1_Read",
         "client_id": os.getenv("ZOHO_CLIENT_ID_1"),
@@ -140,7 +140,8 @@ ZOHO_TOKENS = [
         "last_used": 0,
         "status": "active"
     },
-    # CREATE TOKENS
+    
+    # CREATE TOKEN (3)
     {
         "name": "Token3_Create",
         "client_id": os.getenv("ZOHO_CLIENT_ID_3"),
@@ -152,10 +153,190 @@ ZOHO_TOKENS = [
         "last_used": 0,
         "status": "active"
     },
+    
+    # EXTENDED READ TOKENS (4-8) - Dual Purpose Tokens used as READ
+    {
+        "name": "Token4_Read",
+        "client_id": os.getenv("ZOHO_CLIENT_ID_4"),
+        "client_secret": os.getenv("ZOHO_CLIENT_SECRET_4"),
+        "refresh_token": os.getenv("ZOHO_REFRESH_TOKEN_4"),
+        "scope": "read",
+        "request_count": 0,
+        "error_count": 0,
+        "last_used": 0,
+        "status": "active"
+    },
+    {
+        "name": "Token5_Read",
+        "client_id": os.getenv("ZOHO_CLIENT_ID_5"),
+        "client_secret": os.getenv("ZOHO_CLIENT_SECRET_5"),
+        "refresh_token": os.getenv("ZOHO_REFRESH_TOKEN_5"),
+        "scope": "read",
+        "request_count": 0,
+        "error_count": 0,
+        "last_used": 0,
+        "status": "active"
+    },
+    {
+        "name": "Token6_Read",
+        "client_id": os.getenv("ZOHO_CLIENT_ID_6"),
+        "client_secret": os.getenv("ZOHO_CLIENT_SECRET_6"),
+        "refresh_token": os.getenv("ZOHO_REFRESH_TOKEN_6"),
+        "scope": "read",
+        "request_count": 0,
+        "error_count": 0,
+        "last_used": 0,
+        "status": "active"
+    },
+    {
+        "name": "Token7_Read",
+        "client_id": os.getenv("ZOHO_CLIENT_ID_7"),
+        "client_secret": os.getenv("ZOHO_CLIENT_SECRET_7"),
+        "refresh_token": os.getenv("ZOHO_REFRESH_TOKEN_7"),
+        "scope": "read",
+        "request_count": 0,
+        "error_count": 0,
+        "last_used": 0,
+        "status": "active"
+    },
+    {
+        "name": "Token8_Read",
+        "client_id": os.getenv("ZOHO_CLIENT_ID_8"),
+        "client_secret": os.getenv("ZOHO_CLIENT_SECRET_8"),
+        "refresh_token": os.getenv("ZOHO_REFRESH_TOKEN_8"),
+        "scope": "read",
+        "request_count": 0,
+        "error_count": 0,
+        "last_used": 0,
+        "status": "active"
+    },
+    
+    # NEW READ TOKENS (9-18)
+    {
+        "name": "Token9_Read",
+        "client_id": os.getenv("ZOHO_CLIENT_ID_9"),
+        "client_secret": os.getenv("ZOHO_CLIENT_SECRET_9"),
+        "refresh_token": os.getenv("ZOHO_REFRESH_TOKEN_9"),
+        "scope": "read",
+        "request_count": 0,
+        "error_count": 0,
+        "last_used": 0,
+        "status": "active"
+    },
+    {
+        "name": "Token10_Read",
+        "client_id": os.getenv("ZOHO_CLIENT_ID_10"),
+        "client_secret": os.getenv("ZOHO_CLIENT_SECRET_10"),
+        "refresh_token": os.getenv("ZOHO_REFRESH_TOKEN_10"),
+        "scope": "read",
+        "request_count": 0,
+        "error_count": 0,
+        "last_used": 0,
+        "status": "active"
+    },
+    {
+        "name": "Token11_Read",
+        "client_id": os.getenv("ZOHO_CLIENT_ID_11"),
+        "client_secret": os.getenv("ZOHO_CLIENT_SECRET_11"),
+        "refresh_token": os.getenv("ZOHO_REFRESH_TOKEN_11"),
+        "scope": "read",
+        "request_count": 0,
+        "error_count": 0,
+        "last_used": 0,
+        "status": "active"
+    },
+    {
+        "name": "Token12_Read",
+        "client_id": os.getenv("ZOHO_CLIENT_ID_12"),
+        "client_secret": os.getenv("ZOHO_CLIENT_SECRET_12"),
+        "refresh_token": os.getenv("ZOHO_REFRESH_TOKEN_12"),
+        "scope": "read",
+        "request_count": 0,
+        "error_count": 0,
+        "last_used": 0,
+        "status": "active"
+    },
+    {
+        "name": "Token13_Read",
+        "client_id": os.getenv("ZOHO_CLIENT_ID_13"),
+        "client_secret": os.getenv("ZOHO_CLIENT_SECRET_13"),
+        "refresh_token": os.getenv("ZOHO_REFRESH_TOKEN_13"),
+        "scope": "read",
+        "request_count": 0,
+        "error_count": 0,
+        "last_used": 0,
+        "status": "active"
+    },
+    {
+        "name": "Token14_Read",
+        "client_id": os.getenv("ZOHO_CLIENT_ID_14"),
+        "client_secret": os.getenv("ZOHO_CLIENT_SECRET_14"),
+        "refresh_token": os.getenv("ZOHO_REFRESH_TOKEN_14"),
+        "scope": "read",
+        "request_count": 0,
+        "error_count": 0,
+        "last_used": 0,
+        "status": "active"
+    },
+    {
+        "name": "Token15_Read",
+        "client_id": os.getenv("ZOHO_CLIENT_ID_15"),
+        "client_secret": os.getenv("ZOHO_CLIENT_SECRET_15"),
+        "refresh_token": os.getenv("ZOHO_REFRESH_TOKEN_15"),
+        "scope": "read",
+        "request_count": 0,
+        "error_count": 0,
+        "last_used": 0,
+        "status": "active"
+    },
+    {
+        "name": "Token16_Read",
+        "client_id": os.getenv("ZOHO_CLIENT_ID_16"),
+        "client_secret": os.getenv("ZOHO_CLIENT_SECRET_16"),
+        "refresh_token": os.getenv("ZOHO_REFRESH_TOKEN_16"),
+        "scope": "read",
+        "request_count": 0,
+        "error_count": 0,
+        "last_used": 0,
+        "status": "active"
+    },
+    {
+        "name": "Token17_Read",
+        "client_id": os.getenv("ZOHO_CLIENT_ID_17"),
+        "client_secret": os.getenv("ZOHO_CLIENT_SECRET_17"),
+        "refresh_token": os.getenv("ZOHO_REFRESH_TOKEN_17"),
+        "scope": "read",
+        "request_count": 0,
+        "error_count": 0,
+        "last_used": 0,
+        "status": "active"
+    },
+    {
+        "name": "Token18_Read",
+        "client_id": os.getenv("ZOHO_CLIENT_ID_18"),
+        "client_secret": os.getenv("ZOHO_CLIENT_SECRET_18"),
+        "refresh_token": os.getenv("ZOHO_REFRESH_TOKEN_18"),
+        "scope": "read",
+        "request_count": 0,
+        "error_count": 0,
+        "last_used": 0,
+        "status": "active"
+    },
 ]
 
 # Remove tokens with missing credentials
 ZOHO_TOKENS = [t for t in ZOHO_TOKENS if t["client_id"] and t["client_secret"] and t["refresh_token"]]
+
+read_token_count = sum(1 for t in ZOHO_TOKENS if t["scope"] == "read")
+create_token_count = sum(1 for t in ZOHO_TOKENS if t["scope"] == "create")
+
+print(f"\n{'='*80}")
+print(f"[TOKENS] Token Pool Initialized")
+print(f"{'='*80}")
+print(f"✅ Total Tokens Loaded: {len(ZOHO_TOKENS)}")
+print(f"📖 Read Tokens: {read_token_count}")
+print(f"✍️  Create Tokens: {create_token_count}")
+print(f"{'='*80}\n")
 
 # Fallback to single token config
 ZOHO_CLIENT_ID = os.getenv("ZOHO_CLIENT_ID")
@@ -238,11 +419,19 @@ async def require_auth(request: Request) -> User:
     return user
 
 # ============================================================
-# TOKEN MANAGEMENT
+# TOKEN CACHING (ADD THIS NEAR THE TOP)
+# ============================================================
+
+# Cache structure: {token_config_name: {"access_token": "...", "expires_at": timestamp}}
+token_cache = {}
+token_cache_lock = threading.Lock()
+
+# ============================================================
+# TOKEN MANAGEMENT (REPLACE YOUR EXISTING get_zoho_token)
 # ============================================================
 
 def get_zoho_token(scope_needed: str = "read", max_retries: int = None) -> tuple:
-    """Get Zoho token with automatic fallback"""
+    """Get Zoho token with automatic fallback and caching"""
     global current_read_index, current_create_index
     
     available_tokens = [t for t in ZOHO_TOKENS if t["scope"] == scope_needed and t["status"] != "disabled"]
@@ -262,8 +451,24 @@ def get_zoho_token(scope_needed: str = "read", max_retries: int = None) -> tuple
         for attempt in range(min(max_retries, len(available_tokens))):
             token_index = (start_index + attempt) % len(available_tokens)
             token_config = available_tokens[token_index]
+            token_name = token_config["name"]
+            
+            # ✅ CHECK CACHE FIRST
+            with token_cache_lock:
+                if token_name in token_cache:
+                    cached = token_cache[token_name]
+                    remaining_time = cached["expires_at"] - time.time()
+                    
+                    # If more than 5 minutes remaining, use cached token
+                    if remaining_time > 300:
+                        print(f"[TOKEN] ✓ Using cached {token_name} (expires in {int(remaining_time/60)} min)")
+                        # ❌ REMOVED: Don't rotate! Keep using the same token
+                        return cached["access_token"], token_name
+                    else:
+                        print(f"[TOKEN] ⚠️ Cached {token_name} expiring soon ({int(remaining_time)}s), refreshing...")
             
             try:
+                # Rate limiting
                 time_since_last = time.time() - token_config["last_used"]
                 if time_since_last < 0.3:
                     time.sleep(0.3 - time_since_last)
@@ -279,29 +484,53 @@ def get_zoho_token(scope_needed: str = "read", max_retries: int = None) -> tuple
                 response = requests.post(token_url, params=params, timeout=10)
                 response.raise_for_status()
                 
-                access_token = response.json()["access_token"]
-                token_name = token_config["name"]
+                response_data = response.json()
+                
+                # Check for error response
+                if "error" in response_data:
+                    error_msg = response_data.get("error")
+                    error_desc = response_data.get("error_description", "")
+                    print(f"[TOKEN] ✗ {token_name} OAuth error: {error_msg} - {error_desc}")
+                    token_config["error_count"] += 1
+                    token_config["status"] = "invalid"
+                    continue
+                
+                # Check for access token
+                if "access_token" not in response_data:
+                    print(f"[TOKEN] ✗ {token_name} missing access_token in response")
+                    token_config["error_count"] += 1
+                    continue
+                
+                access_token = response_data["access_token"]
+                expires_in = response_data.get("expires_in", 3600)
+                
+                # ✅ CACHE THE TOKEN
+                with token_cache_lock:
+                    token_cache[token_name] = {
+                        "access_token": access_token,
+                        "expires_at": time.time() + expires_in
+                    }
                 
                 token_config["last_used"] = time.time()
                 token_config["request_count"] += 1
                 
+                # ✅ ONLY rotate on FIRST successful generation (not on cache hits)
                 if scope_needed == "read":
-                    current_read_index = (token_index + 1) % len(available_tokens)
+                    current_read_index = token_index  # Stay on this token
                 else:
-                    current_create_index = (token_index + 1) % len(available_tokens)
+                    current_create_index = token_index  # Stay on this token
                 
-                print(f"[TOKEN] ✓ Using {token_name}")
+                print(f"[TOKEN] ✓ Generated new {token_name} (valid for {expires_in}s, cached)")
                 return access_token, token_name
                 
             except Exception as e:
                 token_config["error_count"] += 1
-                print(f"[TOKEN] ✗ {token_config['name']} failed: {e}")
+                print(f"[TOKEN] ✗ {token_name} failed: {e}")
                 
                 if attempt < max_retries - 1:
                     continue
     
     return None, None
-
 
 def get_zoho_access_token():
     """Legacy single token auth with fallback"""
@@ -710,7 +939,7 @@ def validate_file_format(file_content: bytes, filename: str) -> dict:
 
 
 def download_file_from_url(file_url: str) -> tuple:
-    """Download file from URL with Zoho OAuth support"""
+    """Download file from URL with proper file type detection"""
     print(f"[DOWNLOAD] Downloading...")
     
     if file_url.startswith('/api/v2.1/'):
@@ -734,10 +963,52 @@ def download_file_from_url(file_url: str) -> tuple:
         response.raise_for_status()
         
         file_content = response.content
+        
+        # ✅ FIX: Detect actual file type from content (magic bytes)
+        if file_content[:4] == b'%PDF':
+            # It's a PDF
+            extension = '.pdf'
+            print(f"[DOWNLOAD] ⚠️ Detected PDF file")
+        elif file_content[:2] == b'\xff\xd8':
+            # JPEG
+            extension = '.jpg'
+        elif file_content[:4] == b'\x89PNG':
+            # PNG
+            extension = '.png'
+        elif len(file_content) > 12 and file_content[8:12] == b'WEBP':
+            # WebP
+            extension = '.webp'
+        else:
+            # Unknown, check URL or Content-Type header
+            content_type = response.headers.get('Content-Type', '').lower()
+            if 'pdf' in content_type:
+                extension = '.pdf'
+            elif 'jpeg' in content_type or 'jpg' in content_type:
+                extension = '.jpg'
+            elif 'png' in content_type:
+                extension = '.png'
+            else:
+                # Last resort: check URL
+                url_lower = file_url.lower()
+                if '.pdf' in url_lower:
+                    extension = '.pdf'
+                elif any(ext in url_lower for ext in ['.jpg', '.jpeg']):
+                    extension = '.jpg'
+                elif '.png' in url_lower:
+                    extension = '.png'
+                else:
+                    extension = '.jpg'  # Final fallback
+        
+        # Get filename from URL or use generic name
         filename = file_url.split('/')[-1].split('?')[0]
         
-        if not any(filename.lower().endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.pdf']):
-            filename = "downloaded_file.jpg"
+        # If filename doesn't have proper extension, add detected one
+        if not any(filename.lower().endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.pdf', '.webp']):
+            filename = f"downloaded_file{extension}"
+        else:
+            # Replace extension with detected one if they don't match
+            base_name = filename.rsplit('.', 1)[0]
+            filename = f"{base_name}{extension}"
         
         print(f"[DOWNLOAD] ✓ {filename} ({len(file_content):,} bytes)")
         return file_content, filename
@@ -746,6 +1017,46 @@ def download_file_from_url(file_url: str) -> tuple:
         print(f"[DOWNLOAD] ✗ Error: {str(e)}")
         raise
 
+def convert_filters_to_zoho_criteria(filters: list) -> str:
+    """
+    Convert UI filters to Zoho Creator criteria format
+    """
+    if not filters:
+        return None
+    
+    criteria_parts = []
+    
+    for filter_item in filters:
+        field = filter_item.get("field", "")
+        operator = filter_item.get("operator", "")
+        value = filter_item.get("value", "")
+        
+        if not field or not operator:
+            continue
+        
+        # Convert operator to Zoho format
+        if operator == "equals":
+            criteria_parts.append(f'{field} == "{value}"')
+        
+        elif operator == "not equals":
+            criteria_parts.append(f'{field} != "{value}"')
+        
+        elif operator in ["is not empty", "is_not_empty"]:
+            criteria_parts.append(f'{field} != ""')
+        
+        elif operator in ["is empty", "is_empty"]:
+            criteria_parts.append(f'{field} == ""')
+        
+        elif operator == "contains":
+            criteria_parts.append(f'{field}.contains("{value}")')
+        
+        elif operator == "does not contain":
+            criteria_parts.append(f'!{field}.contains("{value}")')
+    
+    if criteria_parts:
+        return " && ".join(criteria_parts)
+    
+    return None
 
 def process_single_file(file_content: bytes, filename: str, doc_type: str) -> dict:
     """Process a single file using Gemini Vision"""
@@ -1832,6 +2143,18 @@ async def preview_extraction(
     """Preview records for extraction"""
     try:
         print(f"[PREVIEW] Loading records from {report_link_name}...")
+
+        zoho_criteria = None
+        if filter_criteria:
+            try:
+                filters = json.loads(filter_criteria)
+                zoho_criteria = convert_filters_to_zoho_criteria(filters)
+                print(f"[PREVIEW] 🔍 Converted filters to: {zoho_criteria}")
+            except Exception as e:
+                print(f"[PREVIEW] ⚠️ Filter error: {e}")
+                # Fallback: if already a string, use it
+                if isinstance(filter_criteria, str) and filter_criteria.strip():
+                    zoho_criteria = filter_criteria
         
         fetch_all_bool = fetch_all.lower() in ('true', '1', 'yes')
         include_already_extracted_bool = include_already_extracted.lower() in ('true', '1', 'yes')
@@ -1845,7 +2168,7 @@ async def preview_extraction(
         records = fetch_zoho_records(
             app_link_name=app_link_name,
             report_link_name=report_link_name,
-            criteria=filter_criteria,
+            criteria=zoho_criteria,
             max_records=max_records
         )
         
@@ -1939,6 +2262,18 @@ async def start_extraction(
         })
     
     try:
+        # ✅ All lines below 'try:' should have 8 spaces (2 levels of indentation)
+        zoho_criteria = None
+        if filter_criteria:
+            try:
+                filters = json.loads(filter_criteria)
+                zoho_criteria = convert_filters_to_zoho_criteria(filters)
+                print(f"[START] 🔍 Converted filters to: {zoho_criteria}")
+            except Exception as e:
+                print(f"[START] ⚠️ Filter error: {e}")
+                if isinstance(filter_criteria, str) and filter_criteria.strip():
+                    zoho_criteria = filter_criteria
+
         selected_ids = []
         if selected_record_ids:
             try:
@@ -1976,7 +2311,7 @@ async def start_extraction(
             "report_link_name": report_link_name,
             "bank_field_name": bank_field_name,
             "bill_field_name": bill_field_name,
-            "filter_criteria": filter_criteria,
+            "filter_criteria": zoho_criteria,
             "selected_record_ids": selected_ids
         }
         
@@ -1986,7 +2321,7 @@ async def start_extraction(
             "report_link_name": report_link_name,
             "bank_field_name": bank_field_name,
             "bill_field_name": bill_field_name,
-            "filter_criteria": filter_criteria,
+            "filter_criteria": zoho_criteria,  # ✅ ALSO CHANGE THIS to zoho_criteria
             "status": "pending"
         }).execute()
         
@@ -2010,7 +2345,6 @@ async def start_extraction(
             "success": False,
             "error": str(e)
         })
-
 
 @app.get("/ocr/auto-extract/status/{job_id}")
 async def get_job_status(job_id: str):

@@ -1,7 +1,8 @@
 """
-Enhanced AI Analyzer Module - FIXED WITH IMAGE VALIDATION
+Enhanced AI Analyzer Module - FIXED WITH IMAGE VALIDATION + PDF SUPPORT
 - Proper image validation before sending to Gemini
 - Automatic image optimization (resize, compress)
+- PDF to image conversion support
 - Better MIME type detection
 - Comprehensive error handling
 """
@@ -13,6 +14,16 @@ import time
 from dotenv import load_dotenv
 from PIL import Image
 import io
+
+# Try to import PDF support
+try:
+    from pdf2image import convert_from_bytes
+    PDF_SUPPORT = True
+    print("[AI Config] ✓ PDF support enabled (pdf2image)")
+except ImportError:
+    PDF_SUPPORT = False
+    print("[AI Config] ⚠️ PDF support disabled - install: pip3 install pdf2image")
+    print("[AI Config] ⚠️ Also install poppler: brew install poppler (macOS)")
 
 load_dotenv()
 
@@ -74,6 +85,7 @@ def validate_and_optimize_image(file_content: bytes, filename: str) -> Tuple[byt
     """
     Validate and optimize image for Gemini Vision
     - Validates image can be opened
+    - Converts PDFs to images
     - Resizes if too large
     - Converts to JPEG if needed
     - Compresses if file size is too large
@@ -82,9 +94,46 @@ def validate_and_optimize_image(file_content: bytes, filename: str) -> Tuple[byt
     """
     print(f"[IMAGE VALIDATION] Validating: {filename} ({len(file_content):,} bytes)")
     
+    # Check if file is a PDF
+    is_pdf = file_content[:4] == b'%PDF' or file_content[:5] == b'\x0a%PDF'
+    
+    if is_pdf:
+        print(f"[IMAGE VALIDATION]   📄 Detected PDF file")
+        
+        if not PDF_SUPPORT:
+            raise Exception(f"PDF file detected but PDF support not installed. Install: pip3 install pdf2image && brew install poppler")
+        
+        try:
+            # Convert PDF to images (take first page only)
+            print(f"[IMAGE VALIDATION]   Converting PDF to image...")
+            images = convert_from_bytes(file_content, dpi=200, first_page=1, last_page=1)
+            
+            if not images:
+                raise Exception("Failed to convert PDF - no pages found")
+            
+            img = images[0]
+            print(f"[IMAGE VALIDATION]   ✓ PDF converted: {img.size} ({img.mode})")
+            
+            # Convert to bytes
+            output = io.BytesIO()
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
+            img.save(output, format='JPEG', quality=90, optimize=True)
+            file_content = output.getvalue()
+            
+            print(f"[IMAGE VALIDATION]   ✓ Converted to JPEG: {len(file_content):,} bytes")
+            
+            # Continue with normal image processing
+            img = Image.open(io.BytesIO(file_content))
+            
+        except Exception as e:
+            print(f"[IMAGE VALIDATION]   ✗ PDF conversion failed: {e}")
+            raise Exception(f"Failed to convert PDF to image: {e}")
+    
     try:
-        # Try to open the image
-        img = Image.open(io.BytesIO(file_content))
+        # Try to open the image (or converted PDF)
+        if not is_pdf:
+            img = Image.open(io.BytesIO(file_content))
         
         # Get original format and size
         original_format = img.format
@@ -177,6 +226,10 @@ def validate_and_optimize_image(file_content: bytes, filename: str) -> Tuple[byt
             return file_content, mime_type
     
     except Exception as e:
+        if is_pdf:
+            # Already handled PDF errors above
+            raise
+        
         print(f"[IMAGE VALIDATION]   ✗ Failed to validate image: {e}")
         
         # Check if file is actually an image by magic bytes
@@ -188,6 +241,11 @@ def validate_and_optimize_image(file_content: bytes, filename: str) -> Tuple[byt
             # Not a valid image format
             print(f"[IMAGE VALIDATION]   ✗ File is NOT a valid image!")
             print(f"[IMAGE VALIDATION]   First 20 bytes: {file_content[:20].hex()}")
+            
+            # Check if it's a PDF
+            if file_content[:4] == b'%PDF' or file_content[:5] == b'\x0a%PDF':
+                print(f"[IMAGE VALIDATION]   ✗ File is a PDF but conversion failed!")
+                raise Exception(f"PDF file detected but conversion failed. Ensure poppler is installed: brew install poppler")
             
             # Try to see if it's text (HTML/JSON error)
             try:
