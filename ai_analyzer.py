@@ -775,3 +775,105 @@ Return your response as a valid JSON object with the fields the user requested.
         import traceback
         traceback.print_exc()
         raise
+
+def analyze_barcode_gemini_vision(file_content: bytes, filename: str) -> Dict[str, Any]:
+    """
+    Extract ALL barcodes from image using Gemini Vision
+    """
+    if not USE_GEMINI:
+        raise Exception("Gemini Vision not available - add GEMINI_API_KEY to .env")
+    
+    print(f"[GEMINI VISION] Analyzing barcode(s): {filename}")
+    
+    try:
+        from google.genai import types
+        
+        # Validate and optimize image
+        optimized_content, mime_type = validate_and_optimize_image(file_content, filename)
+        
+        print(f"[GEMINI VISION] Sending to Gemini: {mime_type}, {len(optimized_content):,} bytes")
+        
+        # ✅ IMPROVED PROMPT - Extract ALL barcodes
+        prompt = """
+You are a barcode/QR code scanner. Extract ALL barcodes from this image.
+
+CRITICAL INSTRUCTIONS:
+- Find and extract EVERY barcode in the image, no matter how many
+- For each barcode, extract the type (QR Code, EAN-13, Code128, etc.) and the exact data
+- Return ALL barcodes, not just the first one
+- If no barcodes found, return empty array
+
+Return ONLY this JSON (with ALL barcodes):
+{
+    "total_barcodes_found": 0,
+    "barcodes": [
+        {"type": "Code 128", "data": "CT270168007IN"},
+        {"type": "Code 128", "data": "CT270168136IN"},
+        ... (include ALL barcodes found)
+    ],
+    "confidence": "high / medium / low"
+}
+"""
+        
+        response = genai_client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=[
+                types.Part.from_bytes(
+                    data=optimized_content,
+                    mime_type=mime_type
+                ),
+                prompt
+            ],
+            config=types.GenerateContentConfig(
+                temperature=0.1,
+                response_mime_type="application/json"
+            )
+        )
+        
+        response_text = response.text.replace("```json", "").replace("```", "").strip()
+        data = json.loads(response_text)
+        
+        if isinstance(data, list) and len(data) > 0:
+            data = data[0]
+        
+        if not isinstance(data, dict):
+            data = {"total_barcodes_found": 0, "barcodes": []}
+        
+        # ✅ Extract all barcodes
+        all_barcodes = data.get('barcodes', [])
+        total_found = len(all_barcodes)
+        
+        print(f"[GEMINI VISION] ✓ Extracted {total_found} barcode(s)")
+        
+        # Show first few
+        for i, bc in enumerate(all_barcodes[:5]):
+            print(f"[GEMINI VISION]   [{i+1}] {bc.get('type')}: {bc.get('data')}")
+        
+        if total_found > 5:
+            print(f"[GEMINI VISION]   ... and {total_found - 5} more")
+        
+        # ✅ Return in expected format
+        # Primary barcode is the first one (for backwards compatibility)
+        primary = all_barcodes[0] if all_barcodes else {}
+        
+        return {
+            "success": True,
+            "barcode_type": primary.get('type'),
+            "barcode_data": primary.get('data'),
+            "total_barcodes_found": total_found,
+            "all_barcodes": all_barcodes,  # ✅ NEW: All barcodes
+            "confidence": data.get('confidence', 'unknown'),
+            "method": "gemini_vision",
+            "token_usage": {
+                "input_tokens": 258,
+                "output_tokens": 100 + (total_found * 20),  # Adjust based on count
+                "total_tokens": 358 + (total_found * 20)
+            }
+        }
+        
+    except Exception as e:
+        print(f"[GEMINI VISION] ✗ Error: {e}")
+        return {
+            "success": False,
+            "error": str(e)
+        }
