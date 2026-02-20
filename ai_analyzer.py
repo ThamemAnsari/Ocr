@@ -15,6 +15,16 @@ from dotenv import load_dotenv
 from PIL import Image
 import io
 
+# ✅ NEW: Register HEIC support at module load
+try:
+    import pillow_heif
+    pillow_heif.register_heif_opener()
+    HEIC_SUPPORT = True
+    print("[AI Config] ✓ HEIC support enabled (pillow-heif)")
+except ImportError:
+    HEIC_SUPPORT = False
+    print("[AI Config] ⚠️ HEIC support disabled - install: pip install pillow-heif")
+
 # Try to import PDF support
 try:
     from pdf2image import convert_from_bytes
@@ -86,6 +96,7 @@ def validate_and_optimize_image(file_content: bytes, filename: str) -> Tuple[byt
     Validate and optimize image for Gemini Vision
     - Validates image can be opened
     - Converts PDFs to images
+    - ✅ NEW: Converts HEIC to JPEG
     - Resizes if too large
     - Converts to JPEG if needed
     - Compresses if file size is too large
@@ -96,6 +107,9 @@ def validate_and_optimize_image(file_content: bytes, filename: str) -> Tuple[byt
     
     # Check if file is a PDF
     is_pdf = file_content[:4] == b'%PDF' or file_content[:5] == b'\x0a%PDF'
+    
+    # ✅ NEW: Check if file is HEIC
+    is_heic = len(file_content) > 12 and b'ftyp' in file_content[:20] and (b'heic' in file_content[:20] or b'heif' in file_content[:20])
     
     if is_pdf:
         print(f"[IMAGE VALIDATION]   📄 Detected PDF file")
@@ -130,9 +144,48 @@ def validate_and_optimize_image(file_content: bytes, filename: str) -> Tuple[byt
             print(f"[IMAGE VALIDATION]   ✗ PDF conversion failed: {e}")
             raise Exception(f"Failed to convert PDF to image: {e}")
     
+    # ✅ NEW: Handle HEIC files
+    elif is_heic:
+        print(f"[IMAGE VALIDATION]   📱 Detected HEIC file")
+        
+        if not HEIC_SUPPORT:
+            raise Exception(f"HEIC file detected but pillow-heif not installed. Install: pip install pillow-heif")
+        
+        try:
+            # Open HEIC image
+            print(f"[IMAGE VALIDATION]   Converting HEIC to JPEG...")
+            img = Image.open(io.BytesIO(file_content))
+            
+            print(f"[IMAGE VALIDATION]   ✓ HEIC opened: {img.size} ({img.mode})")
+            
+            # Convert to RGB if needed
+            if img.mode in ('RGBA', 'LA', 'P'):
+                print(f"[IMAGE VALIDATION]   Converting {img.mode} to RGB")
+                background = Image.new('RGB', img.size, (255, 255, 255))
+                if img.mode == 'P':
+                    img = img.convert('RGBA')
+                background.paste(img, mask=img.split()[-1] if img.mode in ('RGBA', 'LA') else None)
+                img = background
+            elif img.mode != 'RGB':
+                img = img.convert('RGB')
+            
+            # Save as JPEG
+            output = io.BytesIO()
+            img.save(output, format='JPEG', quality=95, optimize=True)
+            file_content = output.getvalue()
+            
+            print(f"[IMAGE VALIDATION]   ✓ Converted to JPEG: {len(file_content):,} bytes")
+            
+            # Continue with normal image processing
+            img = Image.open(io.BytesIO(file_content))
+            
+        except Exception as e:
+            print(f"[IMAGE VALIDATION]   ✗ HEIC conversion failed: {e}")
+            raise Exception(f"Failed to convert HEIC to JPEG: {e}")
+    
     try:
-        # Try to open the image (or converted PDF)
-        if not is_pdf:
+        # Try to open the image (or converted PDF/HEIC)
+        if not is_pdf and not is_heic:
             img = Image.open(io.BytesIO(file_content))
         
         # Get original format and size
@@ -226,8 +279,8 @@ def validate_and_optimize_image(file_content: bytes, filename: str) -> Tuple[byt
             return file_content, mime_type
     
     except Exception as e:
-        if is_pdf:
-            # Already handled PDF errors above
+        if is_pdf or is_heic:
+            # Already handled PDF/HEIC errors above
             raise
         
         print(f"[IMAGE VALIDATION]   ✗ Failed to validate image: {e}")
@@ -237,7 +290,7 @@ def validate_and_optimize_image(file_content: bytes, filename: str) -> Tuple[byt
         is_png = file_content[:4] == b'\x89PNG'
         is_webp = len(file_content) > 12 and file_content[8:12] == b'WEBP'
         
-        if not any([is_jpeg, is_png, is_webp]):
+        if not any([is_jpeg, is_png, is_webp, is_heic]):
             # Not a valid image format
             print(f"[IMAGE VALIDATION]   ✗ File is NOT a valid image!")
             print(f"[IMAGE VALIDATION]   First 20 bytes: {file_content[:20].hex()}")
@@ -246,6 +299,11 @@ def validate_and_optimize_image(file_content: bytes, filename: str) -> Tuple[byt
             if file_content[:4] == b'%PDF' or file_content[:5] == b'\x0a%PDF':
                 print(f"[IMAGE VALIDATION]   ✗ File is a PDF but conversion failed!")
                 raise Exception(f"PDF file detected but conversion failed. Ensure poppler is installed: brew install poppler")
+            
+            # Check if it's HEIC
+            if is_heic:
+                print(f"[IMAGE VALIDATION]   ✗ File is HEIC but conversion failed!")
+                raise Exception(f"HEIC file detected but conversion failed. Install pillow-heif: pip install pillow-heif")
             
             # Try to see if it's text (HTML/JSON error)
             try:
@@ -270,6 +328,8 @@ def validate_and_optimize_image(file_content: bytes, filename: str) -> Tuple[byt
             mime_type = "image/jpeg"
         elif is_webp:
             mime_type = "image/webp"
+        elif is_heic:
+            mime_type = "image/heic"
         else:
             mime_type = "image/jpeg"
         
@@ -333,29 +393,37 @@ def analyze_bank_gemini_vision(file_content: bytes, filename: str) -> Dict[str, 
         print(f"[GEMINI VISION] Sending to Gemini: {mime_type}, {len(optimized_content):,} bytes")
         
         prompt = """
-You are analyzing an Indian bank passbook image. Extract ALL visible details accurately.
+Analyze this Indian bank passbook image.
 
-LOOK FOR THESE FIELDS:
-1. **Account Holder Name**: Usually after "Name:", "A/c Holder:", "Customer Name:"
-2. **Account Number**: 10-18 digit number (NOT phone, NOT MICR)
-3. **IFSC Code**: 4 letters + "0" + 6 alphanumeric (e.g., CNRB0012345)
-4. **Branch Name**: Branch location and city
-5. **Bank Name**: Which bank (Canara, SBI, HDFC, etc.)
+STEP 1 - TRANSCRIBE THE ACCOUNT NUMBER:
+Write each digit of the account number with its position number:
+Position 1: [digit]
+Position 2: [digit]
+Position 3: [digit]
+...continue for every digit...
+Total digit count: [N]
 
-IMPORTANT:
-- Read text carefully, including rotated or small text
-- IFSC always has "0" as 5th character
-- Account is usually 10-16 digits
-- Ignore phone numbers and MICR codes
+STEP 2 - VERIFY REPEATED SEQUENCES:
+List any runs of identical digits you found:
+Example format: "positions 7-11 are all zeros (5 zeros)"
 
-Return ONLY this JSON:
+STEP 3 - OUTPUT JSON:
+Using ONLY what you transcribed above (not memory or guessing), return:
 {
-    "bank_name": "Full bank name or null",
-    "account_holder_name": "Full name or null",
-    "account_number": "Account number or null",
-    "ifsc_code": "IFSC code or null",
-    "branch_name": "Branch name or null"
+    "bank_name": "<as seen>",
+    "account_holder_name": "<as seen>",
+    "account_number": "<paste exact digits from Step 1>",
+    "ifsc_code": "<4 letters + 0 + 6 chars, exactly as seen>",
+    "branch_name": "<as seen>",
+    "digit_count": <number from Step 1>,
+    "confidence": "high|medium|low",
+    "repeated_sequences": "<from Step 2, or 'none'>"
 }
+
+RULES:
+- account_number must be a STRING (not a number) to preserve leading zeros
+- digit_count must equal len(account_number)
+- If anything is unclear, set confidence to "low" — never guess digits
 """
         
         # ✅ Call Gemini with optimized image
@@ -776,104 +844,521 @@ Return your response as a valid JSON object with the fields the user requested.
         traceback.print_exc()
         raise
 
-def analyze_barcode_gemini_vision(file_content: bytes, filename: str) -> Dict[str, Any]:
+# Replace these functions in your ai_analyzer.py
+
+def convert_pdf_to_images(file_content: bytes) -> List[Tuple[bytes, str]]:
     """
-    Extract ALL barcodes from image using Gemini Vision
+    Convert ALL pages of PDF to images
+    Returns list of (image_bytes, mime_type) tuples
+    """
+    print(f"[PDF CONVERTER] Processing multi-page PDF...")
+    
+    if not PDF_SUPPORT:
+        raise Exception("PDF support not installed. Install: pip3 install pdf2image && brew install poppler")
+    
+    try:
+        # Convert ALL pages (not just first page)
+        images = convert_from_bytes(file_content, dpi=200)
+        
+        if not images:
+            raise Exception("Failed to convert PDF - no pages found")
+        
+        print(f"[PDF CONVERTER] ✓ Converted {len(images)} pages from PDF")
+        
+        # Convert each image to JPEG bytes
+        image_list = []
+        for idx, img in enumerate(images, 1):
+            print(f"[PDF CONVERTER]   Page {idx}: {img.size} ({img.mode})")
+            
+            # Convert to RGB if needed
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
+            
+            # Save as JPEG
+            output = io.BytesIO()
+            img.save(output, format='JPEG', quality=90, optimize=True)
+            image_bytes = output.getvalue()
+            
+            image_list.append((image_bytes, "image/jpeg"))
+            print(f"[PDF CONVERTER]   Page {idx}: {len(image_bytes):,} bytes")
+        
+        return image_list
+        
+    except Exception as e:
+        print(f"[PDF CONVERTER] ✗ Conversion failed: {e}")
+        raise Exception(f"Failed to convert PDF to images: {e}")
+
+
+def validate_and_optimize_image_single(file_content: bytes, filename: str) -> Tuple[bytes, str]:
+    """
+    ✅ UPDATED: Validate and optimize a single image with HEIC support
+    Used for individual image processing
+    """
+    print(f"[IMAGE VALIDATION] Validating: {filename} ({len(file_content):,} bytes)")
+    
+    try:
+        # Check for HEIC first
+        is_heic = len(file_content) > 12 and b'ftyp' in file_content[:20] and (b'heic' in file_content[:20] or b'heif' in file_content[:20])
+        
+        if is_heic:
+            print(f"[IMAGE VALIDATION]   📱 Detected HEIC - converting to JPEG...")
+            if not HEIC_SUPPORT:
+                raise Exception("HEIC support not available - install: pip install pillow-heif")
+            
+            img = Image.open(io.BytesIO(file_content))
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
+            
+            output = io.BytesIO()
+            img.save(output, format='JPEG', quality=95, optimize=True)
+            file_content = output.getvalue()
+            print(f"[IMAGE VALIDATION]   ✓ HEIC converted to JPEG: {len(file_content):,} bytes")
+        
+        # Open and validate image
+        img = Image.open(io.BytesIO(file_content))
+        
+        original_format = img.format
+        original_size = img.size
+        original_mode = img.mode
+        
+        print(f"[IMAGE VALIDATION]   Format: {original_format}, Size: {original_size}, Mode: {original_mode}")
+        
+        # Define limits
+        MAX_DIMENSION = 3072
+        MAX_FILE_SIZE_MB = 4
+        TARGET_FILE_SIZE_MB = 2
+        
+        needs_optimization = False
+        
+        # Check dimensions
+        if max(original_size) > MAX_DIMENSION:
+            print(f"[IMAGE VALIDATION]   ⚠️ Image too large, will resize")
+            needs_optimization = True
+        
+        # Check file size
+        size_mb = len(file_content) / (1024 * 1024)
+        if size_mb > MAX_FILE_SIZE_MB:
+            print(f"[IMAGE VALIDATION]   ⚠️ File size {size_mb:.2f}MB too large, will compress")
+            needs_optimization = True
+        
+        # Convert RGBA to RGB
+        if img.mode in ('RGBA', 'LA', 'P'):
+            print(f"[IMAGE VALIDATION]   Converting {img.mode} to RGB")
+            background = Image.new('RGB', img.size, (255, 255, 255))
+            if img.mode == 'P':
+                img = img.convert('RGBA')
+            background.paste(img, mask=img.split()[-1] if img.mode in ('RGBA', 'LA') else None)
+            img = background
+            needs_optimization = True
+        
+        # Optimize if needed
+        if needs_optimization:
+            if max(original_size) > MAX_DIMENSION:
+                ratio = MAX_DIMENSION / max(original_size)
+                new_size = (int(original_size[0] * ratio), int(original_size[1] * ratio))
+                print(f"[IMAGE VALIDATION]   Resizing to: {new_size}")
+                img = img.resize(new_size, Image.Resampling.LANCZOS)
+            
+            output = io.BytesIO()
+            quality = 95
+            
+            while quality >= 60:
+                output.seek(0)
+                output.truncate()
+                img.save(output, format='JPEG', quality=quality, optimize=True)
+                
+                if output.tell() / (1024 * 1024) <= TARGET_FILE_SIZE_MB or quality <= 60:
+                    break
+                
+                quality -= 5
+            
+            optimized_bytes = output.getvalue()
+            mime_type = "image/jpeg"
+            
+            print(f"[IMAGE VALIDATION]   ✓ Optimized: {len(optimized_bytes):,} bytes (quality: {quality})")
+            return optimized_bytes, mime_type
+        
+        else:
+            # Determine MIME type
+            if original_format == 'PNG':
+                mime_type = "image/png"
+            elif original_format in ('JPEG', 'JPG'):
+                mime_type = "image/jpeg"
+            elif original_format == 'WEBP':
+                mime_type = "image/webp"
+            else:
+                # Convert unknown formats
+                output = io.BytesIO()
+                if img.mode != 'RGB':
+                    img = img.convert('RGB')
+                img.save(output, format='JPEG', quality=90, optimize=True)
+                return output.getvalue(), "image/jpeg"
+            
+            print(f"[IMAGE VALIDATION]   ✓ Valid image: {mime_type}")
+            return file_content, mime_type
+    
+    except Exception as e:
+        print(f"[IMAGE VALIDATION]   ✗ Validation failed: {e}")
+        raise
+
+def analyze_barcode_gemini_vision_multi_page(file_content: bytes, filename: str) -> Dict[str, Any]:
+    """
+    ✅ NEW: Extract barcodes from ALL pages of a PDF
+    Handles single images and multi-page PDFs
     """
     if not USE_GEMINI:
         raise Exception("Gemini Vision not available - add GEMINI_API_KEY to .env")
     
-    print(f"[GEMINI VISION] Analyzing barcode(s): {filename}")
+    print(f"[BARCODE EXTRACTION] Starting: {filename}")
     
     try:
         from google.genai import types
         
-        # Validate and optimize image
-        optimized_content, mime_type = validate_and_optimize_image(file_content, filename)
+        # Check if file is PDF
+        is_pdf = file_content[:4] == b'%PDF' or file_content[:5] == b'\x0a%PDF'
         
-        print(f"[GEMINI VISION] Sending to Gemini: {mime_type}, {len(optimized_content):,} bytes")
+        if is_pdf:
+            print(f"[BARCODE EXTRACTION] 📄 Multi-page PDF detected")
+            images_to_process = convert_pdf_to_images(file_content)
+        else:
+            print(f"[BARCODE EXTRACTION] 🖼️ Single image file")
+            optimized, mime_type = validate_and_optimize_image_single(file_content, filename)
+            images_to_process = [(optimized, mime_type)]
         
-        # ✅ IMPROVED PROMPT - Extract ALL barcodes
-        prompt = """
+        print(f"[BARCODE EXTRACTION] Processing {len(images_to_process)} image(s)...")
+        
+        all_barcodes = []
+        total_files_processed = 0
+        
+        # Process each image
+        for page_idx, (image_bytes, mime_type) in enumerate(images_to_process, 1):
+            print(f"\n[BARCODE EXTRACTION] [{page_idx}/{len(images_to_process)}] Processing page/image...")
+            
+            try:
+                prompt = """
 You are a barcode/QR code scanner. Extract ALL barcodes from this image.
 
 CRITICAL INSTRUCTIONS:
 - Find and extract EVERY barcode in the image, no matter how many
-- For each barcode, extract the type (QR Code, EAN-13, Code128, etc.) and the exact data
-- Return ALL barcodes, not just the first one
+- For each barcode, extract the type (Code 128, EAN-13, QR Code, etc.) and the exact data
+- Return ALL barcodes found, even if there are many (9, 12, 18, or more)
 - If no barcodes found, return empty array
 
-Return ONLY this JSON (with ALL barcodes):
+Return ONLY this JSON:
 {
-    "total_barcodes_found": 0,
+    "page": 1,
+    "total_barcodes_on_page": 9,
     "barcodes": [
         {"type": "Code 128", "data": "CT270168007IN"},
-        {"type": "Code 128", "data": "CT270168136IN"},
-        ... (include ALL barcodes found)
-    ],
-    "confidence": "high / medium / low"
+        {"type": "Code 128", "data": "CT270168136IN"}
+    ]
 }
 """
+                
+                # Call Gemini for this image
+                response = genai_client.models.generate_content(
+                    model=GEMINI_MODEL,
+                    contents=[
+                        types.Part.from_bytes(
+                            data=image_bytes,
+                            mime_type=mime_type
+                        ),
+                        prompt
+                    ],
+                    config=types.GenerateContentConfig(
+                        temperature=0.1,
+                        response_mime_type="application/json"
+                    )
+                )
+                
+                response_text = response.text.replace("```json", "").replace("```", "").strip()
+                data = json.loads(response_text)
+                
+                # Handle response format
+                if isinstance(data, list):
+                    data = {"page": page_idx, "total_barcodes_on_page": len(data), "barcodes": data}
+                elif not isinstance(data, dict):
+                    data = {"page": page_idx, "total_barcodes_on_page": 0, "barcodes": []}
+                
+                page_barcodes = data.get('barcodes', [])
+                
+                print(f"[BARCODE EXTRACTION]   ✅ Page {page_idx}: Found {len(page_barcodes)} barcode(s)")
+                
+                # Show first few barcodes from this page
+                for i, bc in enumerate(page_barcodes[:3]):
+                    print(f"[BARCODE EXTRACTION]      [{i+1}] {bc.get('type')}: {bc.get('data')}")
+                
+                if len(page_barcodes) > 3:
+                    print(f"[BARCODE EXTRACTION]      ... and {len(page_barcodes) - 3} more on this page")
+                
+                # Add to all barcodes with page info
+                for barcode in page_barcodes:
+                    barcode['page'] = page_idx
+                    all_barcodes.append(barcode)
+                
+                total_files_processed += 1
+                
+            except json.JSONDecodeError as e:
+                print(f"[BARCODE EXTRACTION]   ⚠️ Page {page_idx}: JSON parse error: {e}")
+                print(f"[BARCODE EXTRACTION]   Raw: {response_text[:200]}...")
+            except Exception as e:
+                print(f"[BARCODE EXTRACTION]   ⚠️ Page {page_idx}: Error: {e}")
+                import traceback
+                traceback.print_exc()
         
-        response = genai_client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=[
-                types.Part.from_bytes(
-                    data=optimized_content,
-                    mime_type=mime_type
-                ),
-                prompt
-            ],
-            config=types.GenerateContentConfig(
-                temperature=0.1,
-                response_mime_type="application/json"
-            )
-        )
+        print(f"\n[BARCODE EXTRACTION] ✅ Complete Summary:")
+        print(f"[BARCODE EXTRACTION]   Total Pages Processed: {total_files_processed}")
+        print(f"[BARCODE EXTRACTION]   Total Barcodes Found: {len(all_barcodes)}")
         
-        response_text = response.text.replace("```json", "").replace("```", "").strip()
-        data = json.loads(response_text)
+        if is_pdf:
+            print(f"[BARCODE EXTRACTION]   Average per page: {len(all_barcodes) / len(images_to_process):.1f}")
         
-        if isinstance(data, list) and len(data) > 0:
-            data = data[0]
+        # Group by type for summary
+        type_summary = {}
+        for bc in all_barcodes:
+            bc_type = bc.get('type', 'Unknown')
+            type_summary[bc_type] = type_summary.get(bc_type, 0) + 1
         
-        if not isinstance(data, dict):
-            data = {"total_barcodes_found": 0, "barcodes": []}
+        print(f"[BARCODE EXTRACTION]   By type:")
+        for bc_type, count in sorted(type_summary.items()):
+            print(f"[BARCODE EXTRACTION]      {bc_type}: {count}")
         
-        # ✅ Extract all barcodes
-        all_barcodes = data.get('barcodes', [])
-        total_found = len(all_barcodes)
-        
-        print(f"[GEMINI VISION] ✓ Extracted {total_found} barcode(s)")
-        
-        # Show first few
-        for i, bc in enumerate(all_barcodes[:5]):
-            print(f"[GEMINI VISION]   [{i+1}] {bc.get('type')}: {bc.get('data')}")
-        
-        if total_found > 5:
-            print(f"[GEMINI VISION]   ... and {total_found - 5} more")
-        
-        # ✅ Return in expected format
-        # Primary barcode is the first one (for backwards compatibility)
+        # Return all barcodes
         primary = all_barcodes[0] if all_barcodes else {}
         
         return {
             "success": True,
-            "barcode_type": primary.get('type'),
-            "barcode_data": primary.get('data'),
-            "total_barcodes_found": total_found,
-            "all_barcodes": all_barcodes,  # ✅ NEW: All barcodes
-            "confidence": data.get('confidence', 'unknown'),
+            "filename": filename,
+            "is_multipage": is_pdf,
+            "total_pages_processed": total_files_processed,
+            "barcode_type": primary.get('type'),  # Primary for compatibility
+            "barcode_data": primary.get('data'),  # Primary for compatibility
+            "total_barcodes_found": len(all_barcodes),
+            "all_barcodes": all_barcodes,  # ✅ ALL barcodes with page info
+            "confidence": "high",
             "method": "gemini_vision",
             "token_usage": {
-                "input_tokens": 258,
-                "output_tokens": 100 + (total_found * 20),  # Adjust based on count
-                "total_tokens": 358 + (total_found * 20)
+                "input_tokens": 258 * total_files_processed,
+                "output_tokens": 100 + (len(all_barcodes) * 20),
+                "total_tokens": (258 * total_files_processed) + 100 + (len(all_barcodes) * 20)
             }
         }
         
     except Exception as e:
-        print(f"[GEMINI VISION] ✗ Error: {e}")
+        print(f"[BARCODE EXTRACTION] ✗ Error: {e}")
+        import traceback
+        traceback.print_exc()
         return {
             "success": False,
-            "error": str(e)
+            "error": str(e),
+            "filename": filename
+        }
+
+
+
+def analyze_barcode_gemini_vision(file_content: bytes, filename: str) -> Dict[str, Any]:
+    """
+    ✅ UPDATED: Extract ALL barcodes from single images and multi-page PDFs
+    
+    Features:
+    - Handles single images and multi-page PDFs
+    - Extracts EVERY barcode found (not just the first)
+    - Validates and optimizes images before processing
+    - Returns comprehensive barcode data with page info
+    - Includes token usage tracking
+    
+    Returns:
+    {
+        "success": True,
+        "filename": "...",
+        "is_multipage": False,
+        "total_pages_processed": 1,
+        "barcode_type": "Code 128",  # Primary (for compatibility)
+        "barcode_data": "CT270168007IN",  # Primary (for compatibility)
+        "total_barcodes_found": 3,
+        "all_barcodes": [  # ✅ NEW: ALL barcodes with page info
+            {"type": "Code 128", "data": "CT270168007IN", "page": 1},
+            {"type": "QR Code", "data": "https://example.com", "page": 1},
+            {"type": "EAN-13", "data": "5901234123457", "page": 2}
+        ],
+        "confidence": "high",
+        "method": "gemini_vision",
+        "token_usage": {...}
+    }
+    """
+    if not USE_GEMINI:
+        raise Exception("Gemini Vision not available - add GEMINI_API_KEY to .env")
+    
+    print(f"[BARCODE EXTRACTION] Starting: {filename}")
+    
+    try:
+        from google.genai import types
+        
+        # Check if file is PDF
+        is_pdf = file_content[:4] == b'%PDF' or file_content[:5] == b'\x0a%PDF'
+        
+        # Convert PDF to images or validate single image
+        if is_pdf:
+            print(f"[BARCODE EXTRACTION] 📄 Multi-page PDF detected")
+            images_to_process = convert_pdf_to_images(file_content)
+        else:
+            print(f"[BARCODE EXTRACTION] 🖼️ Single image file")
+            optimized, mime_type = validate_and_optimize_image_single(file_content, filename)
+            images_to_process = [(optimized, mime_type)]
+        
+        print(f"[BARCODE EXTRACTION] Processing {len(images_to_process)} image(s)...")
+        
+        all_barcodes = []
+        total_pages_processed = 0
+        
+        # Process each image/page
+        for page_idx, (image_bytes, mime_type) in enumerate(images_to_process, 1):
+            print(f"\n[BARCODE EXTRACTION] [{page_idx}/{len(images_to_process)}] Processing page/image...")
+            
+            try:
+                # ✅ IMPROVED PROMPT - Extract ALL barcodes, not just first
+                prompt = """
+You are a barcode/QR code scanner. Extract ALL barcodes from this image.
+
+CRITICAL INSTRUCTIONS:
+- Find and extract EVERY barcode in the image, no matter how many
+- For each barcode, extract the type (Code 128, EAN-13, QR Code, UPC, Codabar, etc.) and the exact data
+- Return ALL barcodes found, even if there are many (5, 9, 12, 18+)
+- If no barcodes found, return empty array
+- Do NOT skip any barcodes
+
+Return ONLY this JSON:
+{
+    "page": 1,
+    "total_barcodes_on_page": 3,
+    "barcodes": [
+        {"type": "Code 128", "data": "CT270168007IN"},
+        {"type": "Code 128", "data": "CT270168136IN"},
+        {"type": "QR Code", "data": "https://example.com"}
+    ]
+}
+"""
+                
+                # Call Gemini Vision API
+                response = genai_client.models.generate_content(
+                    model=GEMINI_MODEL,
+                    contents=[
+                        types.Part.from_bytes(
+                            data=image_bytes,
+                            mime_type=mime_type
+                        ),
+                        prompt
+                    ],
+                    config=types.GenerateContentConfig(
+                        temperature=0.1,
+                        response_mime_type="application/json"
+                    )
+                )
+                
+                # Parse response
+                response_text = response.text.replace("```json", "").replace("```", "").strip()
+                data = json.loads(response_text)
+                
+                # Handle various response formats
+                if isinstance(data, list):
+                    data = {
+                        "page": page_idx,
+                        "total_barcodes_on_page": len(data),
+                        "barcodes": data
+                    }
+                elif not isinstance(data, dict):
+                    data = {
+                        "page": page_idx,
+                        "total_barcodes_on_page": 0,
+                        "barcodes": []
+                    }
+                
+                # Ensure barcodes field exists
+                if 'barcodes' not in data:
+                    data['barcodes'] = []
+                
+                page_barcodes = data.get('barcodes', [])
+                
+                print(f"[BARCODE EXTRACTION]   ✅ Page {page_idx}: Found {len(page_barcodes)} barcode(s)")
+                
+                # Display extracted barcodes
+                for i, bc in enumerate(page_barcodes[:3], 1):
+                    bc_type = bc.get('type', 'Unknown')
+                    bc_data = bc.get('data', '')
+                    print(f"[BARCODE EXTRACTION]      [{i}] {bc_type}: {bc_data}")
+                
+                if len(page_barcodes) > 3:
+                    print(f"[BARCODE EXTRACTION]      ... and {len(page_barcodes) - 3} more on this page")
+                
+                # Add page info to each barcode and collect
+                for barcode in page_barcodes:
+                    barcode['page'] = page_idx
+                    all_barcodes.append(barcode)
+                
+                total_pages_processed += 1
+                
+            except json.JSONDecodeError as e:
+                print(f"[BARCODE EXTRACTION]   ⚠️ Page {page_idx}: JSON parse error: {e}")
+                print(f"[BARCODE EXTRACTION]   Raw response: {response_text[:200]}...")
+            except Exception as e:
+                print(f"[BARCODE EXTRACTION]   ⚠️ Page {page_idx}: Error: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        # Generate summary
+        print(f"\n[BARCODE EXTRACTION] ✅ Complete Summary:")
+        print(f"[BARCODE EXTRACTION]   Total Pages Processed: {total_pages_processed}")
+        print(f"[BARCODE EXTRACTION]   Total Barcodes Found: {len(all_barcodes)}")
+        
+        if is_pdf and len(images_to_process) > 0:
+            avg_per_page = len(all_barcodes) / len(images_to_process)
+            print(f"[BARCODE EXTRACTION]   Average per page: {avg_per_page:.1f}")
+        
+        # Group by barcode type
+        type_summary = {}
+        for bc in all_barcodes:
+            bc_type = bc.get('type', 'Unknown')
+            type_summary[bc_type] = type_summary.get(bc_type, 0) + 1
+        
+        if type_summary:
+            print(f"[BARCODE EXTRACTION]   By type:")
+            for bc_type, count in sorted(type_summary.items()):
+                print(f"[BARCODE EXTRACTION]      {bc_type}: {count}")
+        
+        # Get primary barcode for backwards compatibility
+        primary = all_barcodes[0] if all_barcodes else {}
+        
+        # Calculate token usage
+        input_tokens = 350 * total_pages_processed
+        output_tokens = 150 + (len(all_barcodes) * 25)
+        total_tokens = input_tokens + output_tokens
+        
+        return {
+            "success": True,
+            "filename": filename,
+            "is_multipage": is_pdf,
+            "total_pages_processed": total_pages_processed,
+            "barcode_type": primary.get('type'),  # Primary barcode (for compatibility)
+            "barcode_data": primary.get('data'),  # Primary barcode (for compatibility)
+            "total_barcodes_found": len(all_barcodes),
+            "all_barcodes": all_barcodes,  # ✅ ALL barcodes with page information
+            "barcode_types_summary": type_summary,  # Summary by type
+            "confidence": "high",
+            "method": "gemini_vision",
+            "token_usage": {
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "total_tokens": total_tokens
+            }
+        }
+        
+    except Exception as e:
+        print(f"[BARCODE EXTRACTION] ✗ Error: {e}")
+        import traceback
+        traceback.print_exc()
+        
+        return {
+            "success": False,
+            "error": str(e),
+            "filename": filename
         }

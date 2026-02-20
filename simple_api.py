@@ -38,6 +38,27 @@ from functools import wraps
 from database import log_processing, get_usage_stats, get_all_logs, delete_log
 import secrets
 import httpx
+from enum import Enum
+from typing import Literal
+
+class SyncMode(str, Enum):
+    INSERT = "insert"
+    UPDATE = "update"
+    AUTO = "auto"
+
+# ✅ ADD THIS HERE - BEFORE ZohoSyncRequest
+class ZohoConfig(BaseModel):
+    owner_name: str
+    app_name: str
+    form_name: str
+
+# ✅ NOW THIS WORKS
+class ZohoSyncRequest(BaseModel):
+    config: ZohoConfig  # ← Can now reference ZohoConfig
+    record_ids: List[Any]
+    sync_mode: Literal['insert', 'update', 'auto'] = 'auto'
+    tag: Optional[str] = None
+    tag_color: Optional[str] = 'blue'
 
 load_dotenv()
 
@@ -47,7 +68,7 @@ load_dotenv()
 
 AUTHENTIK_URL = os.getenv("AUTHENTIK_URL", "https://authentik.teameverest.ngo")
 AUTHENTIK_API_TOKEN = os.getenv("AUTHENTIK_API_TOKEN", "")
-FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
+FRONTEND_URL = os.getenv("FRONTEND_URL", "https://810lwl70-5174.inc1.devtunnels.ms")
 SECRET_KEY = os.getenv("SECRET_KEY", secrets.token_urlsafe(32))
 
 # In-memory session storage (use Redis in production)
@@ -93,13 +114,6 @@ app.add_middleware(
 os.makedirs("uploads", exist_ok=True)
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 zoho_bulk = ZohoBulkAPI()
-
-# ============================================================
-# ZOHO PUSH JOB TRACKING (IN-MEMORY)
-# ============================================================
-
-zoho_push_jobs = {}  # Store job progress in memory
-zoho_push_lock = threading.Lock()
 
 # ============================================================
 # SUPABASE INITIALIZATION
@@ -444,7 +458,6 @@ async def require_auth(request: Request) -> User:
         )
     return user
 
-
 def get_workdrive_token() -> tuple:
     """Get Workdrive access token with caching"""
     token_name = "workdrive_token"
@@ -496,213 +509,6 @@ def get_workdrive_token() -> tuple:
         print(f"[WORKDRIVE] ✗ Token generation failed: {e}")
         return None, None
 
-# ============================================================
-# ZOHO PUSH JOB PROCESSING (IN-MEMORY)
-# ============================================================
-
-def process_zoho_push_job(job_id: str, config: Dict):
-    """Background job processor for Zoho push - WITH Push_status UPDATE"""
-    if not supabase:
-        print("[ZOHO PUSH] ✗ Supabase not configured")
-        return
-    
-    try:
-        print(f"\n{'='*80}")
-        print(f"[ZOHO PUSH] Starting Job: {job_id}")
-        print(f"{'='*80}\n")
-        
-        # Update job status
-        with zoho_push_lock:
-            zoho_push_jobs[job_id]["status"] = "running"
-            zoho_push_jobs[job_id]["started_at"] = datetime.now().isoformat()
-        
-        record_ids = config.get('record_ids', [])
-        zoho_config = config.get('config', {})
-        
-        # Build Zoho Creator API URL from dynamic config
-        owner_name = zoho_config.get('owner_name')
-        app_name = zoho_config.get('app_name')
-        form_name = zoho_config.get('form_name')
-        
-        if not all([owner_name, app_name, form_name]):
-            raise Exception("Missing Zoho configuration")
-        
-        zoho_url = f"https://creator.zoho.com/api/v2/{owner_name}/{app_name}/form/{form_name}"
-        print(f"[ZOHO PUSH] Target URL: {zoho_url}")
-        
-        # Fetch records from Supabase
-        records = []
-        for record_id in record_ids:
-            try:
-                response = supabase.table('auto_extraction_results')\
-                    .select('*')\
-                    .eq('id', str(record_id))\
-                    .execute()
-                
-                if response.data and len(response.data) > 0:
-                    records.append(response.data[0])
-            except Exception as e:
-                print(f"[ZOHO PUSH] ✗ Error fetching record {record_id}: {e}")
-        
-        if not records:
-            with zoho_push_lock:
-                zoho_push_jobs[job_id]["status"] = "failed"
-                zoho_push_jobs[job_id]["errors"].append("No valid records found")
-                zoho_push_jobs[job_id]["completed_at"] = datetime.now().isoformat()
-            return
-        
-        # Update total records count
-        with zoho_push_lock:
-            zoho_push_jobs[job_id]["total_records"] = len(records)
-        
-        print(f"[ZOHO PUSH] Processing {len(records)} records")
-        
-        # Get access token (refresh if needed)
-        access_token = get_zoho_access_token()
-        if not access_token:
-            raise Exception("Failed to get Zoho access token")
-        
-        # ✅ Track successfully pushed record IDs
-        successfully_pushed_ids = []
-        
-        # Process records one by one
-        for idx, record in enumerate(records, 1):
-            try:
-                # Helper function to safely convert to float
-                def safe_float(value):
-                    """Safely convert value to float, handling None and non-numeric values"""
-                    if value is None:
-                        return 0.0
-                    if isinstance(value, (int, float)):
-                        return float(value)
-                    if isinstance(value, str):
-                        try:
-                            return float(value)
-                        except ValueError:
-                            return 0.0
-                    return 0.0
-                
-                # Format record for Zoho (simplified version)
-                data = {
-                    "Scholar_Name": record.get('student_name', ''),
-                    "Scholar_ID": record.get('scholar_id', ''),
-                    "Tracking_ID": record.get('Tracking_id', ''),
-                }
-                
-                # Add bank data if available
-                bank_data = record.get('bank_data')
-                if bank_data and isinstance(bank_data, dict):
-                    data.update({
-                        "Account_Number": bank_data.get('account_number', ''),
-                        "Bank_Name": bank_data.get('bank_name', ''),
-                        "Account_Holder_Name": bank_data.get('account_holder_name', ''),
-                        "IFSC_Code": bank_data.get('ifsc_code', ''),
-                        "Branch_Name": bank_data.get('branch_name', '')
-                    })
-                
-                # Add bill data if available - WITH SAFE FLOAT CONVERSION
-                bill_data = record.get('bill_data')
-                if bill_data and isinstance(bill_data, list):
-                    # Add first 5 bills with safe float conversion
-                    for i, bill in enumerate(bill_data[:5], 1):
-                        if isinstance(bill, dict):
-                            # ✅ FIX: Use safe_float to handle None values
-                            amount = safe_float(bill.get('amount'))
-                            data[f"Bill{i}_Amount"] = amount
-                
-                payload = {"data": data}
-                headers = {
-                    'Authorization': f'Zoho-oauthtoken {access_token}',
-                    'Content-Type': 'application/json'
-                }
-                
-                response = requests.post(
-                    zoho_url,
-                    json=payload,
-                    headers=headers,
-                    timeout=30
-                )
-                
-                # Handle token expiry
-                if response.status_code == 401:
-                    print("[ZOHO PUSH] Token expired, refreshing...")
-                    access_token = get_zoho_access_token()
-                    headers['Authorization'] = f'Zoho-oauthtoken {access_token}'
-                    response = requests.post(
-                        zoho_url,
-                        json=payload,
-                        headers=headers,
-                        timeout=30
-                    )
-                
-                response.raise_for_status()
-                
-                # ✅ SUCCESS - Add to successfully pushed list
-                successfully_pushed_ids.append(record['id'])
-                
-                with zoho_push_lock:
-                    zoho_push_jobs[job_id]["successful_records"] += 1
-                    zoho_push_jobs[job_id]["processed_records"] = idx
-                
-                print(f"[ZOHO PUSH] [{idx}/{len(records)}] ✓ {record.get('scholar_id', 'unknown')}")
-                
-            except Exception as e:
-                # Failure
-                with zoho_push_lock:
-                    zoho_push_jobs[job_id]["failed_records"] += 1
-                    zoho_push_jobs[job_id]["processed_records"] = idx
-                    zoho_push_jobs[job_id]["errors"].append({
-                        "record": record.get('scholar_id', 'unknown'),
-                        "error": str(e)
-                    })
-                
-                print(f"[ZOHO PUSH] [{idx}/{len(records)}] ✗ {record.get('scholar_id', 'unknown')}: {e}")
-            
-            time.sleep(1)  # Rate limiting
-        
-        # ✅ UPDATE Push_status in Supabase for successfully pushed records
-        if successfully_pushed_ids:
-            try:
-                print(f"\n[ZOHO PUSH] Updating Push_status for {len(successfully_pushed_ids)} records...")
-                
-                update_result = supabase.table('auto_extraction_results')\
-                    .update({'Push_status': True})\
-                    .in_('id', successfully_pushed_ids)\
-                    .execute()
-                
-                print(f"[ZOHO PUSH] ✅ Updated Push_status for {len(successfully_pushed_ids)} records")
-                
-            except Exception as update_error:
-                print(f"[ZOHO PUSH] ⚠️ Failed to update Push_status: {update_error}")
-                # Don't fail the job, just log the error
-                with zoho_push_lock:
-                    zoho_push_jobs[job_id]["errors"].append({
-                        "type": "status_update_failed",
-                        "error": str(update_error)
-                    })
-        
-        # Job completed
-        with zoho_push_lock:
-            zoho_push_jobs[job_id]["status"] = "completed"
-            zoho_push_jobs[job_id]["completed_at"] = datetime.now().isoformat()
-        
-        print(f"\n{'='*80}")
-        print(f"[ZOHO PUSH] ✅ Completed: {job_id}")
-        print(f"[ZOHO PUSH]   Success: {zoho_push_jobs[job_id]['successful_records']}/{len(records)}")
-        print(f"[ZOHO PUSH]   Failed: {zoho_push_jobs[job_id]['failed_records']}/{len(records)}")
-        print(f"[ZOHO PUSH]   Push_status Updated: {len(successfully_pushed_ids)} records")
-        print(f"{'='*80}\n")
-        
-    except Exception as e:
-        print(f"[ZOHO PUSH] ✗ Job failed: {e}")
-        import traceback
-        traceback.print_exc()
-        
-        with zoho_push_lock:
-            if job_id in zoho_push_jobs:
-                zoho_push_jobs[job_id]["status"] = "failed"
-                zoho_push_jobs[job_id]["errors"].append(str(e))
-                zoho_push_jobs[job_id]["completed_at"] = datetime.now().isoformat()
 
 # ============================================================
 # WORKDRIVE BARCODE EXTRACTION (FIXED)
@@ -1022,6 +828,11 @@ def upload_to_supabase_storage(file_content: bytes, filename: str, folder: str =
     return public_url
 
 
+# ============================================================
+# ✅ FINAL FIX: save_extraction_result
+# Saves to BOTH record_id and Record_id columns
+# ============================================================
+
 @retry_on_network_error(max_retries=3, delay=2)
 def save_extraction_result(
     job_id: str,
@@ -1029,8 +840,6 @@ def save_extraction_result(
     app_link_name: str,
     report_link_name: str,
     student_name: str,
-    scholar_id: Optional[str],
-    tracking_id: Optional[str],
     bank_image_supabase: Optional[str],
     bill_image_supabase: Optional[List[str]],
     bank_data: Optional[Dict],
@@ -1039,34 +848,86 @@ def save_extraction_result(
     error_message: Optional[str] = None,
     processing_time_ms: Optional[int] = None,
     tokens_used: Optional[int] = None,
-    cost_usd: Optional[float] = None
+    cost_usd: Optional[float] = None,
+    scholar_id: Optional[str] = None,
+    tracking_id: Optional[str] = None,
+    email: Optional[str] = None
 ):
-    """Save extraction result to Supabase"""
+    """
+    Save extraction result to Supabase
+    ✅ VERIFIED: Saves to both record_id AND Record_id columns
+    ✅ Schema verified with your exact column list
+    """
     if not supabase:
         return None
     
+    # Build data with ALL your schema columns
     data = {
+        # Required fields
         "job_id": job_id,
-        "record_id": record_id,
+        "record_id": record_id,              # ✅ Lowercase (primary)
+        "Record_id": record_id,              # ✅ CAPITAL R (display field)
         "app_link_name": app_link_name,
         "report_link_name": report_link_name,
+        "status": status,
+        
+        # Student info
         "student_name": student_name,
-        "scholar_id": scholar_id,  
-        "Tracking_id": tracking_id,
+        "email": email,
+        "scholar_id": scholar_id,
+        "tracking_id": tracking_id,
+        
+        # Extraction data
         "bank_image_supabase": bank_image_supabase,
         "bill_image_supabase": bill_image_supabase,
         "bank_data": bank_data,
         "bill_data": bill_data,
-        "status": status,
+        
+        # Status tracking
         "error_message": error_message,
+        "push_status": None,  # Will be set when pushed to Zoho
+        
+        # Processing metrics
         "processing_time_ms": processing_time_ms,
         "tokens_used": tokens_used,
         "cost_usd": float(cost_usd) if cost_usd else 0.0,
+        
+        # Timestamp
         "processed_at": datetime.now().isoformat()
     }
     
-    result = supabase.table("auto_extraction_results").insert(data).execute()
-    return result.data[0] if result.data else None
+    try:
+        result = supabase.table("auto_extraction_results").insert(data).execute()
+        
+        if result.data:
+            row = result.data[0]
+            db_id = row.get('id')
+            db_record_id = row.get('record_id')
+            db_Record_id = row.get('Record_id')
+            db_email = row.get('email')
+            
+            print(f"[SAVE] ✅ Saved to Supabase (row_id: {db_id})")
+            print(f"[SAVE]    record_id: {db_record_id}")
+            print(f"[SAVE]    Record_id: {db_Record_id}")
+            print(f"[SAVE]    email: {db_email}")
+            
+            return row
+        else:
+            print(f"[SAVE] ⚠️ Insert succeeded but no data returned")
+            return None
+            
+    except Exception as save_error:
+        error_msg = str(save_error)
+        print(f"[SAVE] ✗ Error saving to Supabase:")
+        print(f"[SAVE]    {error_msg}")
+        
+        # Helpful diagnostics
+        if "constraint" in error_msg.lower():
+            print(f"[SAVE] 💡 Constraint error - check NOT NULL columns")
+        elif "column" in error_msg.lower():
+            print(f"[SAVE] 💡 Column error - check column names")
+        
+        raise
 
 
 @retry_on_network_error(max_retries=3, delay=2)
@@ -1264,49 +1125,6 @@ def fetch_specific_records_by_ids(app_link_name: str, report_link_name: str, rec
         raise
 
 
-def get_already_extracted_record_ids(app_link_name: str, report_link_name: str) -> set:
-    """Get IDs of already extracted records - FIXED VERSION"""
-    if not supabase:
-        return set()
-    
-    try:
-        extracted_ids = set()
-        page_size = 1000
-        offset = 0
-        
-        while True:
-            response = supabase.table("auto_extraction_results")\
-                .select("record_id, status")\
-                .eq("app_link_name", app_link_name)\
-                .eq("report_link_name", report_link_name)\
-                .eq("status", "success")\
-                .range(offset, offset + page_size - 1)\
-                .execute()
-            
-            if not response.data:
-                break
-            
-            # Add non-null IDs to set
-            for r in response.data:
-                record_id = r.get("record_id")
-                if record_id:  # ✅ Skip null/empty IDs
-                    extracted_ids.add(str(record_id))
-            
-            print(f"[FILTER] Page {offset//page_size + 1}: Added {len(response.data)} records")
-            
-            # Stop if we got less than a full page
-            if len(response.data) < page_size:
-                break
-            
-            offset += page_size
-        
-        print(f"[FILTER] ✅ Total unique extracted IDs: {len(extracted_ids)}")
-        return extracted_ids
-        
-    except Exception as e:
-        print(f"[FILTER] Error: {e}")
-        return set()
-
 def check_active_jobs_for_records(record_ids: List[str]) -> Optional[str]:
     """Check if records are currently being processed"""
     if not supabase or not record_ids:
@@ -1380,7 +1198,6 @@ def get_bank_name_from_ifsc(ifsc_code: str) -> str:
     
     bank_code = ifsc_code[:4].upper()
     return bank_codes.get(bank_code, f"Bank ({bank_code})")
-
 
 def validate_file_format(file_content: bytes, filename: str) -> dict:
     """Validate file format"""
@@ -1630,15 +1447,19 @@ def process_single_file(file_content: bytes, filename: str, doc_type: str) -> di
         }
 
 # ============================================================
-# EXTRACTION WORKER
+# ✅ UPDATED: process_extraction_job with flexible field extraction
 # ============================================================
 
 def process_extraction_job(job_id: str, config: Dict):
-    """Background job processor"""
+    """
+    Background job processor with flexible field extraction
+    ✅ Extracts scholar_id/tracking_id if available
+    ✅ Falls back to email/record_id if needed
+    """
     if not supabase:
         print("[AUTO EXTRACT] ✗ Supabase not configured")
         return
-    
+
     try:
         print(f"\n{'='*80}")
         print(f"[AUTO EXTRACT] Starting Job: {job_id}")
@@ -1699,53 +1520,43 @@ def process_extraction_job(job_id: str, config: Dict):
                         return " ".join(parts)
             return "Unknown"
         
-        def extract_scholar_id(record):
-            """Extract Actual_Scholar_ID from record"""
-            field_value = record.get("Actual_Scholar_ID")
-            
-            if not field_value:
-                field_value = record.get("Scholar_ID") or record.get("ScholarID")
-            
-            if not field_value:
-                return None
-            
-            if isinstance(field_value, str):
-                return field_value.strip() if field_value.strip() else None
-            
-            if isinstance(field_value, dict):
-                display_value = field_value.get("zc_display_value")
-                if display_value:
-                    return display_value.strip()
+        def extract_field_value(record, field_names):
+            """
+            Extract field value, trying multiple possible field names
+            Returns (value, was_found)
+            """
+            for field_name in field_names:
+                field_value = record.get(field_name)
                 
-                id_value = field_value.get("ID")
-                if id_value:
-                    return str(id_value)
+                if not field_value:
+                    continue
+                
+                if isinstance(field_value, str):
+                    return field_value.strip() if field_value.strip() else None, True
+                
+                if isinstance(field_value, dict):
+                    display_value = field_value.get("zc_display_value")
+                    if display_value:
+                        return display_value.strip(), True
+                    
+                    id_value = field_value.get("ID")
+                    if id_value:
+                        return str(id_value), True
             
-            return None
+            return None, False
         
-        def extract_tracking_id(record):
-            """Extract Tracking_ID from record"""
-            field_value = record.get("Tracking_ID")
-            
-            if not field_value:
-                field_value = record.get("TrackingID") or record.get("Tracking_Id")
-            
-            if not field_value:
-                return None
-            
-            if isinstance(field_value, str):
-                return field_value.strip() if field_value.strip() else None
-            
-            if isinstance(field_value, dict):
-                display_value = field_value.get("zc_display_value")
-                if display_value:
-                    return display_value.strip()
-                
-                id_value = field_value.get("ID")
-                if id_value:
-                    return str(id_value)
-            
-            return None
+        # ✅ Try to detect which fields are available
+        first_record = records[0] if records else {}
+        first_keys = set(first_record.keys())
+        
+        has_scholar_id = any(k in first_keys for k in ["Actual_Scholar_ID", "Scholar_ID", "ScholarID"])
+        has_tracking_id = any(k in first_keys for k in ["Tracking_ID", "Tracking_Id", "TrackingID"])
+        has_email = any(k in first_keys for k in ["Email", "email", "student_email"])
+        
+        print(f"[AUTO EXTRACT] Field detection:")
+        print(f"  Scholar ID: {has_scholar_id}")
+        print(f"  Tracking ID: {has_tracking_id}")
+        print(f"  Email: {has_email}\n")
         
         # Process records
         for idx, record in enumerate(records, 1):
@@ -1753,8 +1564,29 @@ def process_extraction_job(job_id: str, config: Dict):
             
             record_id = str(record.get("ID"))
             student_name = extract_student_name(record)
-            scholar_id = extract_scholar_id(record)
-            tracking_id = extract_tracking_id(record)
+            
+            # ✅ Extract optional fields flexibly
+            scholar_id = None
+            tracking_id = None
+            email = None
+            
+            if has_scholar_id:
+                scholar_id, _ = extract_field_value(
+                    record, 
+                    ["Actual_Scholar_ID", "Scholar_ID", "ScholarID"]
+                )
+            
+            if has_tracking_id:
+                tracking_id, _ = extract_field_value(
+                    record, 
+                    ["Tracking_ID", "Tracking_Id", "TrackingID"]
+                )
+            
+            if has_email:
+                email, _ = extract_field_value(
+                    record, 
+                    ["Email", "email", "student_email"]
+                )
             
             print(f"\n[AUTO EXTRACT] [{idx}/{len(records)}] {student_name} (ID: {record_id})")
             
@@ -1762,6 +1594,8 @@ def process_extraction_job(job_id: str, config: Dict):
                 print(f"[AUTO EXTRACT]   📋 Scholar ID: {scholar_id}")
             if tracking_id:
                 print(f"[AUTO EXTRACT]   📋 Tracking ID: {tracking_id}")
+            if email:
+                print(f"[AUTO EXTRACT]   📧 Email: {email}")
             
             bank_image_url_supabase = None
             bill_images_supabase = []
@@ -1795,12 +1629,9 @@ def process_extraction_job(job_id: str, config: Dict):
                                     'gemini_vision'
                                 )
                                 
-                                if supabase:
-                                    bank_image_url_supabase = upload_to_supabase_storage(
-                                        file_content,
-                                        f"bank_{record_id}_{filename}",
-                                        folder="auto-extract/bank"
-                                    )
+                                # Skip Supabase storage upload (bucket issue)
+                                # if supabase:
+                                #     bank_image_url_supabase = upload_to_supabase_storage(...)
                                 
                                 print(f"[AUTO EXTRACT]   ✅ Bank extracted")
                             else:
@@ -1836,13 +1667,10 @@ def process_extraction_job(job_id: str, config: Dict):
                                         'gemini_vision'
                                     )
                                     
-                                    if supabase:
-                                        bill_image_url = upload_to_supabase_storage(
-                                            file_content,
-                                            f"bill{bill_idx}_{record_id}_{filename}",
-                                            folder="auto-extract/bills"
-                                        )
-                                        bill_images_supabase.append(bill_image_url)
+                                    # Skip Supabase storage upload
+                                    # if supabase:
+                                    #     bill_image_url = upload_to_supabase_storage(...)
+                                    #     bill_images_supabase.append(bill_image_url)
                                     
                                     print(f"[AUTO EXTRACT]   ✅ Bill {bill_idx} extracted")
                                 else:
@@ -1874,7 +1702,7 @@ def process_extraction_job(job_id: str, config: Dict):
             
             processing_time = int((time.time() - record_start) * 1000)
             
-            # Save result
+            # ✅ Save result with flexible fields
             if supabase:
                 try:
                     save_extraction_result(
@@ -1885,10 +1713,11 @@ def process_extraction_job(job_id: str, config: Dict):
                         student_name=student_name,
                         scholar_id=scholar_id,
                         tracking_id=tracking_id,
+                        email=email,
                         bank_image_supabase=bank_image_url_supabase,
-                        bill_image_supabase=bill_images_supabase,
+                        bill_image_supabase=bill_images_supabase if bill_images_supabase else None,
                         bank_data=bank_data,
-                        bill_data=bill_data_array,
+                        bill_data=bill_data_array if bill_data_array else None,
                         status=status,
                         error_message=error_msg,
                         processing_time_ms=processing_time,
@@ -1936,7 +1765,6 @@ def process_extraction_job(job_id: str, config: Dict):
             "completed_at": datetime.now().isoformat()
         })
 
-
 # ============================================================
 # UPDATED ENDPOINTS (No Team ID needed!)
 # ============================================================
@@ -1974,6 +1802,643 @@ async def list_workdrive_files(
             "error": str(e)
         })
 
+# Add these endpoints to your FastAPI app (in main.py or server file)
+# These handle local file uploads for barcode extraction
+
+@app.post("/barcode/local/start")
+async def start_local_barcode_extraction(
+    request: Request
+):
+    """Start barcode extraction job from local uploaded files"""
+    if not supabase:
+        return JSONResponse(status_code=500, content={
+            "success": False,
+            "error": "Supabase not configured"
+        })
+    
+    try:
+        form = await request.form()
+        uploaded_files = form.getlist("files")
+        
+        if not uploaded_files:
+            return JSONResponse(status_code=400, content={
+                "success": False,
+                "error": "No files provided"
+            })
+        
+        job_id = f"barcode_local_{int(time.time())}_{uuid.uuid4().hex[:8]}"
+        
+        # Save uploaded files temporarily
+        temp_files = []
+        for uploaded_file in uploaded_files:
+            file_content = await uploaded_file.read()
+            
+            # Create temporary file path
+            temp_file_path = f"temp_uploads/{job_id}_{uploaded_file.filename}"
+            os.makedirs("temp_uploads", exist_ok=True)
+            
+            with open(temp_file_path, "wb") as f:
+                f.write(file_content)
+            
+            temp_files.append({
+                "file_id": f"local_{uuid.uuid4().hex}",
+                "filename": uploaded_file.filename,
+                "temp_path": temp_file_path,
+                "size": len(file_content)
+            })
+        
+        # Create job in Supabase
+        supabase.table("barcode_extraction_jobs").insert({
+            "job_id": job_id,
+            "source": "local",
+            "total_files": len(temp_files),
+            "status": "pending"
+        }).execute()
+        
+        # Start processing in background
+        config = {
+            "job_id": job_id,
+            "source": "local",
+            "temp_files": temp_files
+        }
+        
+        thread = threading.Thread(
+            target=process_local_barcode_extraction_job,
+            args=(job_id, config)
+        )
+        thread.daemon = True
+        thread.start()
+        
+        return JSONResponse(content={
+            "success": True,
+            "job_id": job_id,
+            "status": "started",
+            "message": f"🚀 Processing {len(temp_files)} files",
+            "check_status_url": f"/barcode/workdrive/status/{job_id}"
+        })
+        
+    except Exception as e:
+        print(f"[LOCAL] ✗ Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return JSONResponse(status_code=500, content={
+            "success": False,
+            "error": str(e)
+        })
+
+def process_local_barcode_extraction_job(job_id: str, config: Dict):
+    """Background job processor with FIXES"""
+    if not supabase:
+        print("[LOCAL BARCODE] ✗ Supabase not configured")
+        return
+    
+    try:
+        print(f"\n{'='*80}")
+        print(f"[LOCAL BARCODE] Starting Local Job: {job_id}")
+        print(f"{'='*80}\n")
+        
+        supabase.table("barcode_extraction_jobs").update({
+            "status": "running",
+            "started_at": datetime.now().isoformat()
+        }).eq("job_id", job_id).execute()
+        
+        temp_files = config['temp_files']
+        total_cost = 0.0
+        processed = 0
+        successful = 0
+        failed = 0
+        total_barcodes_extracted = 0
+        
+        for idx, file_info in enumerate(temp_files, 1):
+            record_start = time.time()
+            
+            file_id = file_info['file_id']
+            filename = file_info['filename']
+            temp_path = file_info['temp_path']
+            
+            print(f"\n[LOCAL BARCODE] [{idx}/{len(temp_files)}] Processing: {filename}")
+            
+            try:
+                # Read file content
+                with open(temp_path, "rb") as f:
+                    file_content = f.read()
+                
+                # Extract barcodes
+                result = analyze_barcode_gemini_vision(file_content, filename)
+                
+                if result.get('success'):
+                    # ✅ FIX 1: SKIP image upload - just set to None
+                    supabase_url = None
+                    print(f"[LOCAL BARCODE]   📤 Image upload disabled (bucket not found)")
+                    
+                    # Calculate cost
+                    tokens = result.get('token_usage', {})
+                    cost = calculate_cost(
+                        tokens.get('input_tokens', 0),
+                        tokens.get('output_tokens', 0),
+                        'gemini_vision'
+                    )
+                    total_cost += cost
+                    
+                    # Extract barcodes
+                    all_barcodes = result.get('all_barcodes', [])
+                    total_found = len(all_barcodes)
+                    is_multipage = result.get('is_multipage', False)
+                    pages_processed = result.get('total_pages_processed', 1)
+                    
+                    total_barcodes_extracted += total_found
+                    
+                    # ✅ FIX 2: Add delay between inserts to avoid "Resource temporarily unavailable"
+                    if total_found > 0:
+                        print(f"[LOCAL BARCODE]   💾 Saving {total_found} barcode(s) to database...")
+                        print(f"[LOCAL BARCODE]   ⏱️ Adding 0.1s delay between inserts to prevent network errors...\n")
+                        
+                        saved_count = 0
+                        for barcode_idx, barcode in enumerate(all_barcodes, 1):
+                            try:
+                                insert_data = {
+                                    "job_id": job_id,
+                                    "file_id": file_id,
+                                    "filename": filename,
+                                    "barcode_number": barcode_idx,
+                                    "total_barcodes_in_file": total_found,
+                                    "barcode_data": barcode.get('data'),
+                                    "barcode_type": barcode.get('type'),
+                                    "page_number": barcode.get('page', 1),
+                                    "is_primary": barcode_idx == 1,
+                                    "image_url": supabase_url,  # Will be None
+                                    "status": "success",
+                                    "tokens_used": tokens.get('total_tokens', 0),
+                                    "cost_usd": cost / total_found if total_found > 0 else 0,
+                                    "processing_time_ms": int((time.time() - record_start) * 1000),
+                                    "is_multipage": is_multipage,
+                                    "pages_processed": pages_processed,
+                                    "source": "local"
+                                }
+                                
+                                # ✅ FIX 2: Add delay BEFORE insert
+                                if barcode_idx > 1:
+                                    time.sleep(0.1)
+                                
+                                supabase.table("barcode_extraction_results").insert(insert_data).execute()
+                                saved_count += 1
+                                
+                                # Only log every 5th barcode to reduce spam
+                                if barcode_idx % 5 == 1 or barcode_idx == 1:
+                                    print(f"[LOCAL BARCODE]      ✅ Saved barcode {barcode_idx}/{total_found}")
+                                
+                            except Exception as save_error:
+                                print(f"[LOCAL BARCODE]      ❌ Failed barcode {barcode_idx}: {save_error}")
+                                import traceback
+                                traceback.print_exc()
+                        
+                        if saved_count == total_found:
+                            successful += 1
+                            print(f"[LOCAL BARCODE]   ✅ All {total_found} barcodes saved successfully\n")
+                        else:
+                            failed += 1
+                            print(f"[LOCAL BARCODE]   ⚠️ Only {saved_count}/{total_found} barcodes saved\n")
+                    else:
+                        failed += 1
+                        supabase.table("barcode_extraction_results").insert({
+                            "job_id": job_id,
+                            "file_id": file_id,
+                            "filename": filename,
+                            "status": "no_barcode",
+                            "error_message": "No barcodes detected in image",
+                            "source": "local"
+                        }).execute()
+                        print(f"[LOCAL BARCODE]   ⚠️ No barcodes found\n")
+                else:
+                    failed += 1
+                    supabase.table("barcode_extraction_results").insert({
+                        "job_id": job_id,
+                        "file_id": file_id,
+                        "filename": filename,
+                        "status": "failed",
+                        "error_message": result.get('error'),
+                        "source": "local"
+                    }).execute()
+                    print(f"[LOCAL BARCODE]   ✗ Failed: {result.get('error')}\n")
+                
+            except Exception as file_error:
+                failed += 1
+                print(f"[LOCAL BARCODE]   ✗ Error: {file_error}\n")
+                try:
+                    supabase.table("barcode_extraction_results").insert({
+                        "job_id": job_id,
+                        "file_id": file_id,
+                        "filename": filename,
+                        "status": "failed",
+                        "error_message": str(file_error),
+                        "source": "local"
+                    }).execute()
+                except:
+                    pass
+            finally:
+                # Clean up temp file
+                try:
+                    if os.path.exists(temp_path):
+                        os.remove(temp_path)
+                except:
+                    pass
+            
+            processed += 1
+            
+            # Update job progress
+            try:
+                supabase.table("barcode_extraction_jobs").update({
+                    "processed_files": processed,
+                    "successful_files": successful,
+                    "failed_files": failed,
+                    "total_cost_usd": round(total_cost, 6),
+                    "total_barcodes_extracted": total_barcodes_extracted
+                }).eq("job_id", job_id).execute()
+            except:
+                pass
+        
+        # Job completed
+        supabase.table("barcode_extraction_jobs").update({
+            "status": "completed",
+            "completed_at": datetime.now().isoformat(),
+            "total_cost_usd": round(total_cost, 6),
+            "total_barcodes_extracted": total_barcodes_extracted
+        }).eq("job_id", job_id).execute()
+        
+        print(f"\n{'='*80}")
+        print(f"[LOCAL BARCODE] ✅ Job Completed: {job_id}")
+        print(f"{'='*80}")
+        print(f"[LOCAL BARCODE]   Files Processed: {successful}/{len(temp_files)}")
+        print(f"[LOCAL BARCODE]   Total Barcodes Extracted: {total_barcodes_extracted} ✅")
+        print(f"[LOCAL BARCODE]   Failed: {failed}/{len(temp_files)}")
+        print(f"[LOCAL BARCODE]   Total Cost: ${total_cost:.6f}")
+        print(f"{'='*80}\n")
+        
+    except Exception as e:
+        print(f"[LOCAL BARCODE] ✗ Job failed: {e}")
+        import traceback
+        traceback.print_exc()
+        try:
+            supabase.table("barcode_extraction_jobs").update({
+                "status": "failed",
+                "completed_at": datetime.now().isoformat()
+            }).eq("job_id", job_id).execute()
+        except:
+            pass
+
+
+# ============================================================
+# BARCODE EXTRACTION DEBUGGER
+# Add these endpoints to find exactly where extraction fails
+# ============================================================
+
+@app.post("/barcode/test-extraction")
+async def test_barcode_extraction(
+    file_url: str = Form(...)
+):
+    """
+    Test barcode extraction end-to-end with detailed logging
+    Helps identify exactly where the process fails
+    """
+    print(f"\n{'='*80}")
+    print(f"[DEBUG] TESTING BARCODE EXTRACTION PIPELINE")
+    print(f"{'='*80}")
+    print(f"[DEBUG] File URL: {file_url}\n")
+    
+    debug_log = []
+    
+    try:
+        # Step 1: Download file
+        print(f"[DEBUG] STEP 1: Downloading file...")
+        debug_log.append("STEP 1: Starting download")
+        
+        file_content, filename = download_file_from_url(file_url)
+        
+        print(f"[DEBUG] ✅ Downloaded: {filename}")
+        print(f"[DEBUG]    Size: {len(file_content):,} bytes")
+        print(f"[DEBUG]    First 20 bytes: {file_content[:20].hex()}\n")
+        debug_log.append(f"Downloaded: {filename} ({len(file_content)} bytes)")
+        
+        # Step 2: Validate image
+        print(f"[DEBUG] STEP 2: Validating image...")
+        debug_log.append("STEP 2: Validating image")
+        
+        try:
+            from ai_analyzer import validate_and_optimize_image_single
+            optimized_content, mime_type = validate_and_optimize_image_single(file_content, filename)
+            print(f"[DEBUG] ✅ Image valid")
+            print(f"[DEBUG]    MIME type: {mime_type}")
+            print(f"[DEBUG]    Size after optimization: {len(optimized_content):,} bytes\n")
+            debug_log.append(f"Image validated: {mime_type}")
+        except Exception as validation_error:
+            print(f"[DEBUG] ❌ Image validation failed: {validation_error}\n")
+            debug_log.append(f"Image validation failed: {validation_error}")
+            raise
+        
+        # Step 3: Call Gemini Vision
+        print(f"[DEBUG] STEP 3: Calling Gemini Vision API...")
+        debug_log.append("STEP 3: Calling Gemini Vision")
+        
+        try:
+            # ✅ Call the ACTUAL extraction function
+            result = analyze_barcode_gemini_vision(file_content, filename)
+            
+            print(f"[DEBUG] ✅ Gemini response received")
+            print(f"[DEBUG]    success: {result.get('success')}")
+            print(f"[DEBUG]    error: {result.get('error')}")
+            print(f"[DEBUG]    barcode_type: {result.get('barcode_type')}")
+            print(f"[DEBUG]    barcode_data: {result.get('barcode_data')}")
+            print(f"[DEBUG]    total_barcodes_found: {result.get('total_barcodes_found', 0)}")
+            print(f"[DEBUG]    is_multipage: {result.get('is_multipage')}")
+            print(f"[DEBUG]    total_pages_processed: {result.get('total_pages_processed')}")
+            
+            debug_log.append(f"Gemini response: success={result.get('success')}")
+            
+            if not result.get('success'):
+                print(f"[DEBUG] ❌ Analysis failed!\n")
+                debug_log.append(f"Analysis failed: {result.get('error')}")
+                
+                return JSONResponse(content={
+                    "success": False,
+                    "stage": "gemini_analysis",
+                    "error": result.get('error'),
+                    "debug_log": debug_log
+                })
+            
+            # Step 4: Check all_barcodes
+            print(f"\n[DEBUG] STEP 4: Checking extracted barcodes...")
+            debug_log.append("STEP 4: Extracting barcodes")
+            
+            all_barcodes = result.get('all_barcodes', [])
+            print(f"[DEBUG] ✅ all_barcodes extracted")
+            print(f"[DEBUG]    Count: {len(all_barcodes)}")
+            print(f"[DEBUG]    Type: {type(all_barcodes)}")
+            print(f"[DEBUG]    Content:\n")
+            
+            for idx, bc in enumerate(all_barcodes[:5], 1):
+                print(f"[DEBUG]       [{idx}] type={bc.get('type')}, data={bc.get('data')}, page={bc.get('page')}")
+            
+            if len(all_barcodes) > 5:
+                print(f"[DEBUG]       ... and {len(all_barcodes) - 5} more")
+            
+            print()
+            debug_log.append(f"Extracted {len(all_barcodes)} barcodes")
+            
+            if len(all_barcodes) == 0:
+                print(f"[DEBUG] ⚠️ WARNING: No barcodes found!")
+                print(f"[DEBUG]    This might be expected if image has no barcodes\n")
+            
+            # Step 5: Test database insert
+            print(f"[DEBUG] STEP 5: Testing database insert...")
+            debug_log.append("STEP 5: Testing insert")
+            
+            if len(all_barcodes) > 0:
+                test_barcode = all_barcodes[0]
+                
+                test_data = {
+                    "job_id": "debug_test",
+                    "file_id": "debug_test",
+                    "filename": filename,
+                    "barcode_number": 1,
+                    "total_barcodes_in_file": len(all_barcodes),
+                    "barcode_data": test_barcode.get('data'),
+                    "barcode_type": test_barcode.get('type'),
+                    "page_number": test_barcode.get('page', 1),
+                    "is_primary": True,
+                    "status": "debug_test"
+                }
+                
+                print(f"[DEBUG]    Test data: {test_data}\n")
+                
+                try:
+                    supabase.table("barcode_extraction_results").insert(test_data).execute()
+                    print(f"[DEBUG] ✅ Insert successful!\n")
+                    debug_log.append("Insert successful")
+                    
+                    # Clean up test record
+                    supabase.table("barcode_extraction_results")\
+                        .delete()\
+                        .eq("job_id", "debug_test")\
+                        .execute()
+                    print(f"[DEBUG]    (Test record cleaned up)\n")
+                    
+                except Exception as insert_error:
+                    print(f"[DEBUG] ❌ Insert failed: {insert_error}\n")
+                    debug_log.append(f"Insert failed: {insert_error}")
+                    import traceback
+                    traceback.print_exc()
+                    raise
+            else:
+                print(f"[DEBUG] ⚠️ Skipping insert test (no barcodes to insert)\n")
+                debug_log.append("No barcodes to insert")
+            
+            # Success!
+            print(f"{'='*80}")
+            print(f"[DEBUG] ✅ ALL TESTS PASSED!")
+            print(f"{'='*80}\n")
+            
+            return JSONResponse(content={
+                "success": True,
+                "stage": "completed",
+                "result": result,
+                "debug_log": debug_log,
+                "message": "Extraction pipeline working perfectly!"
+            })
+            
+        except Exception as gemini_error:
+            print(f"[DEBUG] ❌ Gemini error: {gemini_error}\n")
+            debug_log.append(f"Gemini error: {gemini_error}")
+            import traceback
+            traceback.print_exc()
+            
+            return JSONResponse(status_code=500, content={
+                "success": False,
+                "stage": "gemini_analysis",
+                "error": str(gemini_error),
+                "debug_log": debug_log
+            })
+    
+    except Exception as e:
+        print(f"[DEBUG] ❌ FATAL ERROR: {e}\n")
+        debug_log.append(f"Fatal error: {e}")
+        import traceback
+        traceback.print_exc()
+        
+        return JSONResponse(status_code=500, content={
+            "success": False,
+            "stage": "unknown",
+            "error": str(e),
+            "debug_log": debug_log
+        })
+
+
+@app.get("/barcode/test-local-file")
+async def test_with_sample_file():
+    """
+    Test extraction with a known image file
+    """
+    print(f"\n[DEBUG] Testing with sample image...\n")
+    
+    # Try to find a sample image
+    import os
+    
+    sample_paths = [
+        "uploads/sample.jpg",
+        "test_image.jpg",
+        "sample.jpg",
+    ]
+    
+    sample_file = None
+    for path in sample_paths:
+        if os.path.exists(path):
+            sample_file = path
+            break
+    
+    if not sample_file:
+        return JSONResponse(status_code=400, content={
+            "success": False,
+            "error": "No sample file found",
+            "message": "Place a test image at: uploads/sample.jpg"
+        })
+    
+    try:
+        with open(sample_file, 'rb') as f:
+            file_content = f.read()
+        
+        print(f"[DEBUG] Testing with: {sample_file} ({len(file_content):,} bytes)\n")
+        
+        # Run extraction
+        result = analyze_barcode_gemini_vision(file_content, sample_file)
+        
+        print(f"[DEBUG] Result:")
+        print(f"[DEBUG]   success: {result.get('success')}")
+        print(f"[DEBUG]   barcodes found: {result.get('total_barcodes_found', 0)}")
+        print(f"[DEBUG]   all_barcodes: {result.get('all_barcodes')}\n")
+        
+        return JSONResponse(content={
+            "success": result.get('success'),
+            "filename": sample_file,
+            "total_barcodes_found": result.get('total_barcodes_found', 0),
+            "all_barcodes": result.get('all_barcodes', []),
+            "result": result
+        })
+        
+    except Exception as e:
+        print(f"[DEBUG] Error: {e}\n")
+        import traceback
+        traceback.print_exc()
+        
+        return JSONResponse(status_code=500, content={
+            "success": False,
+            "error": str(e)
+        })
+
+
+@app.post("/barcode/check-gemini-response")
+async def check_gemini_response(
+    prompt: str = Form(...),
+    file_url: str = Form(...)
+):
+    """
+    Test Gemini Vision with a custom prompt
+    See exactly what Gemini returns
+    """
+    print(f"\n[DEBUG] Testing Gemini Response...\n")
+    
+    try:
+        # Download file
+        file_content, filename = download_file_from_url(file_url)
+        
+        from ai_analyzer import validate_and_optimize_image_single
+        optimized_content, mime_type = validate_and_optimize_image_single(file_content, filename)
+        
+        from google.genai import types
+        
+        response = genai_client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=[
+                types.Part.from_bytes(
+                    data=optimized_content,
+                    mime_type=mime_type
+                ),
+                prompt
+            ],
+            config=types.GenerateContentConfig(
+                temperature=0.1,
+                response_mime_type="application/json"
+            )
+        )
+        
+        response_text = response.text
+        
+        print(f"[DEBUG] Raw Gemini Response:")
+        print(f"[DEBUG] {response_text}\n")
+        
+        # Try to parse as JSON
+        try:
+            import json
+            clean_text = response_text.replace("```json", "").replace("```", "").strip()
+            parsed = json.loads(clean_text)
+            
+            return JSONResponse(content={
+                "success": True,
+                "raw_response": response_text,
+                "parsed_json": parsed,
+                "type": str(type(parsed)),
+                "keys": list(parsed.keys()) if isinstance(parsed, dict) else "N/A"
+            })
+        except json.JSONDecodeError as json_error:
+            return JSONResponse(content={
+                "success": False,
+                "error": f"Failed to parse JSON: {json_error}",
+                "raw_response": response_text
+            })
+        
+    except Exception as e:
+        print(f"[DEBUG] Error: {e}\n")
+        import traceback
+        traceback.print_exc()
+        
+        return JSONResponse(status_code=500, content={
+            "success": False,
+            "error": str(e)
+        })
+
+
+@app.get("/barcode/list-recent-results/{limit}")
+async def list_recent_results(limit: int = 10):
+    """
+    List recent barcode extraction results
+    Shows what's actually being stored
+    """
+    try:
+        response = supabase.table("barcode_extraction_results")\
+            .select("*")\
+            .order("created_at", desc=True)\
+            .limit(limit)\
+            .execute()
+        
+        print(f"\n[DEBUG] Found {len(response.data)} recent results\n")
+        
+        for result in response.data[:5]:
+            print(f"[DEBUG] ID: {result.get('id')}")
+            print(f"[DEBUG]   Job: {result.get('job_id')}")
+            print(f"[DEBUG]   File: {result.get('filename')}")
+            print(f"[DEBUG]   Barcode: {result.get('barcode_data')}")
+            print(f"[DEBUG]   Status: {result.get('status')}")
+            print(f"[DEBUG]   Created: {result.get('created_at')}\n")
+        
+        return JSONResponse(content={
+            "success": True,
+            "total_results": len(response.data),
+            "results": response.data
+        })
+        
+    except Exception as e:
+        return JSONResponse(status_code=500, content={
+            "success": False,
+            "error": str(e)
+        })
 
 @app.post("/barcode/workdrive/preview")
 async def preview_workdrive_extraction(
@@ -2068,9 +2533,597 @@ async def start_workdrive_barcode_extraction(
             "error": str(e)
         })
 
+# ============================================================
+
+
+@app.post("/zoho/sync-records")
+async def sync_records_to_zoho(request: ZohoSyncRequest):
+    """
+    Smart sync endpoint that INSERT/UPDATE and tracks sync status
+    
+    ✅ NEW: Updates Supabase with push_status = "synced"
+    This ensures records won't be fetched again in preview
+    """
+    try:
+        if not supabase:
+            return JSONResponse(status_code=400, content={
+                "success": False,
+                "error": "Supabase not configured"
+            })
+        
+        print(f"\n{'='*80}")
+        print(f"SMART SYNC TO ZOHO CREATOR")
+        print(f"{'='*80}")
+        print(f"Sync Mode: {request.sync_mode.upper()}")
+        print(f"Total Records: {len(request.record_ids)}")
+        if request.tag:
+            print(f"Tag: {request.tag} ({request.tag_color})")
+        print(f"{'='*80}\n")
+        
+        # Convert record_ids to strings
+        record_ids_str = [str(rid) for rid in request.record_ids]
+        
+        # Fetch full records from Supabase
+        records_to_sync = []
+        supabase_ids = []  # Track Supabase record IDs for sync status update
+        
+        for record_id in record_ids_str:
+            try:
+                response = supabase.table('auto_extraction_results')\
+                    .select('*')\
+                    .eq('id', record_id)\
+                    .execute()
+                
+                if response.data and len(response.data) > 0:
+                    record = response.data[0]
+                    records_to_sync.append(record)
+                    supabase_ids.append(record.get('id'))
+                else:
+                    print(f"⚠️ Record {record_id} not found")
+            except Exception as fetch_error:
+                print(f"❌ Error fetching record {record_id}: {fetch_error}")
+        
+        if not records_to_sync:
+            return JSONResponse(status_code=400, content={
+                "success": False,
+                "error": "No valid records found"
+            })
+        
+        print(f"✅ Fetched {len(records_to_sync)} records from Supabase\n")
+        
+        # Get Zoho access token
+        access_token = os.getenv("ZOHO_ACCESS_TOKEN")
+        if not access_token:
+            access_token = get_zoho_access_token()
+        
+        if not access_token:
+            return JSONResponse(status_code=400, content={
+                "success": False,
+                "error": "Failed to get Zoho access token"
+            })
+        
+        # Build Zoho form URL
+        form_url = f"https://creator.zoho.com/api/v2/{request.config.owner_name}/{request.config.app_name}/form/{request.config.form_name}"
+        
+        headers = {
+            'Authorization': f'Zoho-oauthtoken {access_token}',
+            'Content-Type': 'application/json'
+        }
+        
+        results = {
+            "total_records": len(records_to_sync),
+            "successful": 0,
+            "inserted": 0,
+            "updated": 0,
+            "failed": 0,
+            "errors": [],
+            "sync_details": []
+        }
+        
+        # Track successfully synced IDs
+        successfully_synced_ids = []
+        
+        # Process each record
+        for idx, record in enumerate(records_to_sync, 1):
+            record_id = record.get('id')
+            zoho_record_id = record.get('record_id')
+            scholar_id = record.get('scholar_id', record.get('Scholar_ID', 'unknown'))
+            
+            print(f"[{idx}/{len(records_to_sync)}] Processing {scholar_id}...", end=' ')
+            
+            try:
+                # Format record for Zoho
+                zoho_record = format_record_for_zoho_creator(record)
+                
+                # Add tag if provided
+                if request.tag:
+                    zoho_record['tag'] = request.tag
+                    zoho_record['tag_color'] = request.tag_color
+                
+                # Determine sync action
+                sync_action = request.sync_mode
+                existing_id = None
+                
+                if request.sync_mode == 'auto':
+                    # Check if record exists in Zoho by Scholar_ID
+                    scholar_id_field = zoho_record.get('Scholar_ID')
+                    
+                    if scholar_id_field:
+                        check_url = f"https://creator.zoho.com/api/v2/{request.config.owner_name}/{request.config.app_name}/report/All_{request.config.form_name}"
+                        
+                        check_response = requests.get(
+                            check_url,
+                            headers=headers,
+                            params={
+                                'criteria': f'Scholar_ID == "{scholar_id_field}"',
+                                'max_records': 1
+                            },
+                            timeout=10
+                        )
+                        
+                        if check_response.status_code == 200:
+                            data = check_response.json()
+                            if data.get('data') and len(data['data']) > 0:
+                                existing_record = data['data'][0]
+                                sync_action = 'update'
+                                existing_id = existing_record.get('ID')
+                            else:
+                                sync_action = 'insert'
+                        else:
+                            sync_action = 'insert'
+                
+                # Perform the sync action
+                if sync_action == 'insert':
+                    # POST for new record
+                    payload = {"data": zoho_record}
+                    
+                    response = requests.post(
+                        form_url,
+                        json=payload,
+                        headers=headers,
+                        timeout=30
+                    )
+                    
+                    response.raise_for_status()
+                    zoho_response = response.json()
+                    
+                    results['successful'] += 1
+                    results['inserted'] += 1
+                    successfully_synced_ids.append(record_id)
+                    print("✅ INSERTED")
+                    
+                    results['sync_details'].append({
+                        "record_id": record_id,
+                        "zoho_record_id": zoho_record_id,
+                        "scholar_id": scholar_id,
+                        "action": "INSERT",
+                        "status": "success"
+                    })
+                
+                elif sync_action == 'update':
+                    if not existing_id and request.sync_mode != 'update':
+                        results['failed'] += 1
+                        print("⚠️ NOT FOUND (update mode)")
+                        results['sync_details'].append({
+                            "record_id": record_id,
+                            "scholar_id": scholar_id,
+                            "action": "UPDATE",
+                            "status": "not_found"
+                        })
+                    else:
+                        if existing_id:
+                            update_url = f"{form_url}/{existing_id}"
+                            payload = {"data": zoho_record}
+                            
+                            response = requests.put(
+                                update_url,
+                                json=payload,
+                                headers=headers,
+                                timeout=30
+                            )
+                            
+                            response.raise_for_status()
+                            zoho_response = response.json()
+                            
+                            results['successful'] += 1
+                            results['updated'] += 1
+                            successfully_synced_ids.append(record_id)
+                            print("🔄 UPDATED")
+                            
+                            results['sync_details'].append({
+                                "record_id": record_id,
+                                "zoho_record_id": zoho_record_id,
+                                "scholar_id": scholar_id,
+                                "action": "UPDATE",
+                                "zoho_id": existing_id,
+                                "status": "success"
+                            })
+                        else:
+                            results['failed'] += 1
+                            print("❌ NOT FOUND")
+                            results['sync_details'].append({
+                                "record_id": record_id,
+                                "scholar_id": scholar_id,
+                                "action": "UPDATE",
+                                "status": "not_found"
+                            })
+                
+            except Exception as record_error:
+                results['failed'] += 1
+                error_msg = str(record_error)
+                print(f"❌ {error_msg[:50]}")
+                
+                results['errors'].append({
+                    "record_id": record_id,
+                    "scholar_id": scholar_id,
+                    "error": error_msg
+                })
+                
+                results['sync_details'].append({
+                    "record_id": record_id,
+                    "scholar_id": scholar_id,
+                    "status": "failed",
+                    "error": error_msg
+                })
+            
+            time.sleep(0.5)  # Rate limiting
+        
+        # ============================================================
+        # ✅ NEW: Update Supabase records with sync status
+        # This marks them as synced so they're excluded in future previews
+        # ============================================================
+        print(f"\n[SYNC] Updating Supabase sync status for {len(successfully_synced_ids)} records...")
+        
+        for supabase_id in successfully_synced_ids:
+            try:
+                update_data = {
+                    "push_status": "synced",
+                    "synced_at": datetime.now().isoformat(),
+                    "sync_mode": request.sync_mode
+                }
+                
+                if request.tag:
+                    update_data["tag"] = request.tag
+                    update_data["tag_color"] = request.tag_color
+                
+                supabase.table('auto_extraction_results')\
+                    .update(update_data)\
+                    .eq('id', supabase_id)\
+                    .execute()
+                    
+            except Exception as update_error:
+                print(f"⚠️ Failed to update sync status for {supabase_id}: {update_error}")
+        
+        print(f"[SYNC] ✅ Updated {len(successfully_synced_ids)} records in Supabase")
+        
+        # Final summary
+        print(f"\n{'='*80}")
+        print(f"SYNC COMPLETE")
+        print(f"{'='*80}")
+        print(f"✅ Total Successful: {results['successful']}/{len(records_to_sync)}")
+        print(f"  ➕ Inserted: {results['inserted']}")
+        print(f"  🔄 Updated: {results['updated']}")
+        print(f"❌ Failed: {results['failed']}/{len(records_to_sync)}")
+        print(f"📊 Marked in Supabase as synced: {len(successfully_synced_ids)}")
+        
+        if results['errors']:
+            print(f"\nErrors:")
+            for error in results['errors'][:3]:
+                print(f"  - {error['scholar_id']}: {error['error'][:60]}")
+        
+        print(f"{'='*80}\n")
+        
+        return JSONResponse(content={
+            "success": results['successful'] > 0,
+            "message": f"✅ Synced {results['successful']}/{len(records_to_sync)} records to Creator",
+            "details": results
+        })
+        
+    except Exception as e:
+        print(f"❌ Sync error: {e}")
+        import traceback
+        traceback.print_exc()
+        return JSONResponse(status_code=500, content={
+            "success": False,
+            "error": str(e)
+        })
+
+@app.post("/ocr/cross-report/async")
+async def cross_report_ocr_async(
+    source_record_id: str = Form(...),
+    source_report_name: str = Form(...),
+    app_link_name: str = Form(...),
+    scholar_id: str = Form(...),
+    scholar_name: str = Form(...),
+    tracking_id: Optional[str] = Form(None),
+    dest_form_name: str = Form(...),
+    bank_passbook_url: Optional[str] = Form(None),
+    bill_urls: Optional[str] = Form(None)
+):
+    """
+    Cross-report OCR - accepts bank URL + bill download URLs
+    Returns IMMEDIATELY, processes in background
+    """
+    try:
+        print(f"\n{'='*80}")
+        print(f"[CROSS-REPORT] New request: {scholar_name} ({scholar_id})")
+        print(f"[CROSS-REPORT] Record ID: {source_record_id}")
+        print(f"{'='*80}")
+
+        # Parse bill URLs from JSON string
+        bill_url_list = []
+        if bill_urls:
+            try:
+                bill_url_list = json.loads(bill_urls)
+                print(f"[CROSS-REPORT] Bill URLs: {len(bill_url_list)}")
+            except Exception as e:
+                print(f"[CROSS-REPORT] ⚠️ Failed to parse bill_urls: {e}")
+
+        if not bank_passbook_url and not bill_url_list:
+            return JSONResponse(status_code=400, content={
+                "success": False,
+                "error": "No files provided"
+            })
+
+        # Build config for background job
+        config = {
+            "source_record_id": source_record_id,
+            "source_report_name": source_report_name,
+            "app_link_name": app_link_name,
+            "scholar_id": scholar_id,
+            "scholar_name": scholar_name,
+            "tracking_id": tracking_id, 
+            "dest_form_name": dest_form_name,
+            "bank_passbook_url": bank_passbook_url,
+            "bill_url_list": bill_url_list
+        }
+
+        # ✅ Start background thread - return immediately
+        thread = threading.Thread(
+            target=process_cross_report_background,
+            args=(config,)
+        )
+        thread.daemon = True
+        thread.start()
+
+        return JSONResponse(content={
+            "success": True,
+            "status": "processing",
+            "message": f"OCR started for {scholar_name}",
+            "record_id": source_record_id
+        })
+
+    except Exception as e:
+        print(f"[CROSS-REPORT] ✗ Error: {e}")
+        return JSONResponse(status_code=500, content={
+            "success": False,
+            "error": str(e)
+        })
+
+
+def process_cross_report_background(config: Dict):
+    """Background processor for cross-report OCR"""
+    scholar_name = config['scholar_name']
+    scholar_id = config['scholar_id']
+
+    print(f"\n[CROSS-REPORT BG] Starting: {scholar_name}")
+
+    bank_data = None
+    bill_data_list = []
+    total_amount = 0.0
+
+    # ✅ STEP 1: Process Bank
+    if config.get('bank_passbook_url'):
+        try:
+            print(f"[CROSS-REPORT BG] Downloading bank passbook...")
+            file_content, filename = download_file_from_url(config['bank_passbook_url'])
+            result = process_single_file(file_content, filename, "bank")
+            if result.get('success'):
+                bank_data = result
+                print(f"[CROSS-REPORT BG] ✅ Bank OCR success")
+            else:
+                print(f"[CROSS-REPORT BG] ✗ Bank OCR failed: {result.get('error')}")
+        except Exception as e:
+            print(f"[CROSS-REPORT BG] ✗ Bank error: {e}")
+
+    # ✅ STEP 2: Process Bills
+    for idx, bill_url in enumerate(config.get('bill_url_list', []), 1):
+        try:
+            print(f"[CROSS-REPORT BG] Downloading bill {idx}...")
+            file_content, filename = download_file_from_url(bill_url)
+            result = process_single_file(file_content, filename, "bill")
+            if result.get('success'):
+                bill_data_list.append(result)
+                amount = result.get('amount') or 0
+                try:
+                    total_amount += float(amount)
+                except:
+                    pass
+                print(f"[CROSS-REPORT BG] ✅ Bill {idx} OCR success")
+            else:
+                print(f"[CROSS-REPORT BG] ✗ Bill {idx} failed: {result.get('error')}")
+        except Exception as e:
+            print(f"[CROSS-REPORT BG] ✗ Bill {idx} error: {e}")
+
+    # ✅ STEP 3: Save to destination form
+    try:
+        access_token, _ = get_zoho_token(scope_needed="create")
+        if not access_token:
+            print(f"[CROSS-REPORT BG] ✗ No create token available")
+            return
+
+        owner, app = config['app_link_name'].split('/', 1)
+        form_url = f"https://creator.zoho.com/api/v2/{owner}/{app}/form/{config['dest_form_name']}"
+
+        # Build bill data string
+        bill_text = ""
+        for i, bill in enumerate(bill_data_list, 1):
+            bill_text += f"Bill {i}: Student: {bill.get('student_name')} | College: {bill.get('college_name')} | Amount: ₹{bill.get('amount', 0)}\n\n"
+
+        data = {
+            "Scholar_ID": scholar_id,
+            "Scholar_Name": scholar_name,
+            "Tracking_ID": config.get('tracking_id'),
+            "Bank_Name": bank_data.get('bank_name', '') if bank_data else '',
+            "Holder_Name": bank_data.get('account_holder_name', '') if bank_data else '',
+            "Account_No": bank_data.get('account_number', '') if bank_data else '',
+            "IFSC_Code": bank_data.get('ifsc_code', '') if bank_data else '',
+            "Branch_Name": bank_data.get('branch_name', '') if bank_data else '',
+            "Bill_Data": bill_text,
+            "Bill1_Amount": bill_data_list[0].get('amount', 0) if len(bill_data_list) > 0 else 0,
+            "Bill2_Amount": bill_data_list[1].get('amount', 0) if len(bill_data_list) > 1 else 0,
+            "Bill3_Amount": bill_data_list[2].get('amount', 0) if len(bill_data_list) > 2 else 0,
+            "Bill4_Amount": bill_data_list[3].get('amount', 0) if len(bill_data_list) > 3 else 0,
+            "Bill5_Amount": bill_data_list[4].get('amount', 0) if len(bill_data_list) > 4 else 0,
+            "Amount": total_amount,
+            "status": "OCR Completed"
+        }
+
+        response = requests.post(
+            form_url,
+            json={"data": data},
+            headers={"Authorization": f"Zoho-oauthtoken {access_token}"},
+            timeout=30
+        )
+
+        print(f"[CROSS-REPORT BG] ✅ Record saved: {response.status_code}")
+        print(f"[CROSS-REPORT BG] Response: {response.text[:200]}")
+
+    except Exception as e:
+        print(f"[CROSS-REPORT BG] ✗ Save error: {e}")
+        import traceback
+        traceback.print_exc()
+
+# ============================================================
+# ✅ HELPER: Format Record for Zoho with Tags
+# ============================================================
+
+def format_record_for_zoho_creator(record: Dict) -> Dict:
+    """
+    Format extraction result for Zoho Creator form
+    Includes tag support for batch tracking
+    """
+    bill_data = record.get('bill_data', {})
+    bank_data = record.get('bank_data', {})
+    
+    # Handle JSON strings
+    if isinstance(bill_data, str):
+        try:
+            bill_data = json.loads(bill_data)
+        except:
+            bill_data = {}
+    
+    if isinstance(bank_data, str):
+        try:
+            bank_data = json.loads(bank_data)
+        except:
+            bank_data = {}
+    
+    # Convert bill_data to array
+    bill_data_array = []
+    if isinstance(bill_data, list):
+        bill_data_array = bill_data
+    elif isinstance(bill_data, dict) and bill_data:
+        bill_data_array = [bill_data]
+    
+    # Safe float conversion
+    def safe_float(value, default=0.0):
+        if value is None or value == "null" or value == "":
+            return default
+        try:
+            return float(value)
+        except:
+            return default
+    
+    # Extract amounts
+    bill1_amount = safe_float(bill_data_array[0].get('amount')) if len(bill_data_array) > 0 else 0.0
+    bill2_amount = safe_float(bill_data_array[1].get('amount')) if len(bill_data_array) > 1 else 0.0
+    bill3_amount = safe_float(bill_data_array[2].get('amount')) if len(bill_data_array) > 2 else 0.0
+    bill4_amount = safe_float(bill_data_array[3].get('amount')) if len(bill_data_array) > 3 else 0.0
+    bill5_amount = safe_float(bill_data_array[4].get('amount')) if len(bill_data_array) > 4 else 0.0
+    
+    total_amount = bill1_amount + bill2_amount + bill3_amount + bill4_amount + bill5_amount
+    
+    # Get scholar info
+    scholar_name = (
+        record.get('Scholar_Name') or 
+        record.get('student_name') or 
+        (bill_data_array[0].get('student_name') if bill_data_array else '') or 
+        ''
+    )
+    
+    scholar_id = (
+        record.get('Scholar_ID') or 
+        record.get('scholar_id') or 
+        (bill_data_array[0].get('scholar_id') if bill_data_array else '') or 
+        ''
+    )
+    
+    # Format bill data with warnings
+    def format_bill_text(bills):
+        if not bills:
+            return ""
+        
+        formatted_parts = []
+        for idx, bill in enumerate(bills):
+            amount = bill.get('amount')
+            
+            if amount is None or amount == 'null':
+                amount_str = "⚠️ Not extracted"
+            else:
+                amount_str = f"₹{safe_float(amount):,.2f}"
+            
+            prefix = f"Bill {idx + 1}: " if len(bills) > 1 else ""
+            part = (
+                f"{prefix}"
+                f"Student: {bill.get('student_name', 'N/A')} | "
+                f"College: {bill.get('college_name', 'N/A')} | "
+                f"Receipt: {bill.get('receipt_number', 'N/A')} | "
+                f"Amount: {amount_str}"
+            )
+            formatted_parts.append(part)
+        
+        return " || ".join(formatted_parts)
+    
+    # Check for null amounts
+    has_null_amounts = any(
+        bill.get('amount') is None or bill.get('amount') == 'null'
+        for bill in bill_data_array
+    ) if bill_data_array else False
+    
+    status = record.get('status', 'completed')
+    if has_null_amounts:
+        status = "⚠️ Review - Missing amounts"
+    
+    # Build Zoho record
+    return {
+        "Scholar_Name": scholar_name,
+        "Scholar_ID": scholar_id,
+        "Tracking_ID": record.get('Tracking_id') or record.get('tracking_id', ''),
+        "Account_No": bank_data.get('account_number', ''),
+        "Bank_Name": bank_data.get('bank_name', ''),
+        "Holder_Name": bank_data.get('account_holder_name', ''),
+        "IFSC_Code": bank_data.get('ifsc_code', ''),
+        "Branch_Name": bank_data.get('branch_name', ''),
+        "Bill_Data": format_bill_text(bill_data_array),
+        "Bill1_Amount": bill1_amount,
+        "Bill2_Amount": bill2_amount,
+        "Bill3_Amount": bill3_amount,
+        "Bill4_Amount": bill4_amount,
+        "Bill5_Amount": bill5_amount,
+        "Total_Amount": total_amount,
+        "Status": status,
+        "Tokens_Used": record.get('tokens_used', 0),
+        "Cost_USD": float(record.get('cost_usd', 0)),
+        # Tags will be added in the endpoint
+    }
+# Replace the barcode processing functions in your main.py
 
 def process_barcode_extraction_job(job_id: str, config: Dict):
-    """Background job processor for barcode extraction - WITH MULTIPLE BARCODES SUPPORT"""
+    """
+    Background job processor for barcode extraction
+    ✅ Handles ALL barcodes from multi-page PDFs
+    """
     if not supabase:
         print("[BARCODE] ✗ Supabase not configured")
         return
@@ -2091,7 +3144,7 @@ def process_barcode_extraction_job(job_id: str, config: Dict):
         processed = 0
         successful = 0
         failed = 0
-        total_barcodes_extracted = 0  # ✅ NEW: Track total barcodes across all files
+        total_barcodes_extracted = 0
         
         for idx, file_id in enumerate(selected_ids, 1):
             record_start = time.time()
@@ -2102,11 +3155,13 @@ def process_barcode_extraction_job(job_id: str, config: Dict):
                 # Download file
                 file_content, filename = download_workdrive_file(file_id)
                 
-                # Extract barcode(s)
+                print(f"[BARCODE]   Downloaded: {filename} ({len(file_content):,} bytes)")
+                
+                # ✅ NEW: Extract ALL barcodes (handles multi-page PDFs)
                 result = analyze_barcode_gemini_vision(file_content, filename)
                 
                 if result.get('success'):
-                    # Upload to Supabase storage
+                    # Upload file to Supabase storage
                     supabase_url = None
                     if supabase:
                         try:
@@ -2127,48 +3182,75 @@ def process_barcode_extraction_job(job_id: str, config: Dict):
                     )
                     total_cost += cost
                     
-                    # ✅ NEW: Extract all barcodes info
-                    total_found = result.get('total_barcodes_found', 1)
-                    all_barcodes_json = result.get('all_barcodes', [])
+                    # ✅ Extract ALL barcodes
+                    all_barcodes = result.get('all_barcodes', [])
+                    total_found = len(all_barcodes)
+                    is_multipage = result.get('is_multipage', False)
+                    pages_processed = result.get('total_pages_processed', 1)
+                    
+                    total_barcodes_extracted += total_found
+                    
+                    # ✅ Get primary barcode (first one) for compatibility
                     primary_barcode = result.get('barcode_data')
                     primary_type = result.get('barcode_type')
                     
-                    # Track total barcodes across all files
-                    total_barcodes_extracted += total_found
-                    
-                    # ✅ UPDATED: Save result with all_barcodes JSON field
-                    supabase.table("barcode_extraction_results").insert({
-                        "job_id": job_id,
-                        "file_id": file_id,
-                        "filename": filename,
-                        "barcode_data": primary_barcode,  # First/primary barcode
-                        "barcode_type": primary_type,     # First/primary type
-                        "confidence": result.get('confidence'),
-                        "all_barcodes": all_barcodes_json,  # ✅ NEW: Store ALL barcodes as JSON
-                        "image_url": supabase_url,
-                        "status": "success",
-                        "tokens_used": tokens.get('total_tokens', 0),
-                        "cost_usd": cost,
-                        "processing_time_ms": int((time.time() - record_start) * 1000)
-                    }).execute()
-                    
-                    successful += 1
-                    
-                    # ✅ UPDATED: Enhanced logging
-                    if total_found > 1:
-                        print(f"[BARCODE]   ✅ Extracted {total_found} barcodes:")
-                        print(f"[BARCODE]      Primary: {primary_barcode} ({primary_type})")
+                    # ✅ NEW: Save ALL barcodes individually to database
+                    # This allows searching/filtering by individual barcode
+                    if total_found > 0:
+                        print(f"[BARCODE]   Saving {total_found} barcode(s) to database...")
                         
-                        # Show first few additional barcodes
-                        for i, bc in enumerate(all_barcodes_json[1:min(4, len(all_barcodes_json))], 1):
-                            print(f"[BARCODE]      [{i+1}] {bc.get('data')} ({bc.get('type')})")
+                        for barcode_idx, barcode in enumerate(all_barcodes, 1):
+                            try:
+                                supabase.table("barcode_extraction_results").insert({
+                                    "job_id": job_id,
+                                    "file_id": file_id,
+                                    "filename": filename,
+                                    "barcode_number": barcode_idx,  # Position in file
+                                    "total_barcodes_in_file": total_found,
+                                    "barcode_data": barcode.get('data'),
+                                    "barcode_type": barcode.get('type'),
+                                    "page_number": barcode.get('page', 1),  # For PDFs
+                                    "is_primary": barcode_idx == 1,
+                                    "image_url": supabase_url,
+                                    "status": "success",
+                                    "tokens_used": tokens.get('total_tokens', 0),
+                                    "cost_usd": cost / total_found if total_found > 0 else 0,
+                                    "processing_time_ms": int((time.time() - record_start) * 1000),
+                                    "is_multipage": is_multipage,
+                                    "pages_processed": pages_processed
+                                }).execute()
+                            except Exception as save_error:
+                                print(f"[BARCODE]   ⚠️ Failed to save barcode {barcode_idx}: {save_error}")
                         
-                        if total_found > 4:
-                            print(f"[BARCODE]      ... and {total_found - 4} more")
+                        successful += 1
+                        
+                        # Enhanced logging
+                        print(f"[BARCODE]   ✅ Extracted {total_found} barcode(s):")
+                        
+                        if is_multipage:
+                            print(f"[BARCODE]      📄 Multi-page PDF: {pages_processed} pages")
+                        
+                        # Show first 5
+                        for i, bc in enumerate(all_barcodes[:5]):
+                            page_info = f" (page {bc.get('page')})" if bc.get('page') else ""
+                            print(f"[BARCODE]      [{i+1}] {bc.get('type')}: {bc.get('data')}{page_info}")
+                        
+                        if total_found > 5:
+                            print(f"[BARCODE]      ... and {total_found - 5} more")
                     else:
-                        print(f"[BARCODE]   ✅ Extracted: {primary_barcode} ({primary_type})")
+                        # No barcodes found but extraction succeeded
+                        failed += 1
+                        supabase.table("barcode_extraction_results").insert({
+                            "job_id": job_id,
+                            "file_id": file_id,
+                            "filename": filename,
+                            "status": "no_barcode",
+                            "error_message": "No barcodes detected in image",
+                            "processing_time_ms": int((time.time() - record_start) * 1000)
+                        }).execute()
+                        print(f"[BARCODE]   ⚠️ No barcodes found")
                 else:
-                    # Failed to extract
+                    # Extraction failed
                     failed += 1
                     supabase.table("barcode_extraction_results").insert({
                         "job_id": job_id,
@@ -2201,26 +3283,29 @@ def process_barcode_extraction_job(job_id: str, config: Dict):
                     "processed_files": processed,
                     "successful_files": successful,
                     "failed_files": failed,
-                    "total_cost_usd": round(total_cost, 6)
+                    "total_cost_usd": round(total_cost, 6),
+                    "total_barcodes_extracted": total_barcodes_extracted  # ✅ NEW
                 }).eq("job_id", job_id).execute()
             except:
                 pass
             
-            time.sleep(0.5)  # Rate limiting
+            time.sleep(0.5)
         
         # Job completed
         supabase.table("barcode_extraction_jobs").update({
             "status": "completed",
             "completed_at": datetime.now().isoformat(),
-            "total_cost_usd": round(total_cost, 6)
+            "total_cost_usd": round(total_cost, 6),
+            "total_barcodes_extracted": total_barcodes_extracted  # ✅ NEW
         }).eq("job_id", job_id).execute()
         
         print(f"\n{'='*80}")
-        print(f"[BARCODE] ✅ Completed: {job_id}")
+        print(f"[BARCODE] ✅ Job Completed: {job_id}")
+        print(f"{'='*80}")
         print(f"[BARCODE]   Files Processed: {successful}/{len(selected_ids)}")
-        print(f"[BARCODE]   Total Barcodes Extracted: {total_barcodes_extracted}")  # ✅ NEW
+        print(f"[BARCODE]   Total Barcodes Extracted: {total_barcodes_extracted} ✅")
         print(f"[BARCODE]   Failed: {failed}/{len(selected_ids)}")
-        print(f"[BARCODE]   Cost: ${total_cost:.6f}")
+        print(f"[BARCODE]   Total Cost: ${total_cost:.6f}")
         print(f"{'='*80}\n")
         
     except Exception as e:
@@ -2561,6 +3646,371 @@ async def get_active_sessions(current_user: User = Depends(require_auth)):
         ]
     }
 
+
+# ============================================================
+# BANK FOLDER EXTRACTION
+# Reuses auto_extraction_jobs + auto_extraction_results tables
+# ============================================================
+
+SUPPORTED_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.webp', '.pdf', '.bmp'}
+
+def scan_folder_for_images(folder_path: str, recursive: bool = False) -> List[Dict]:
+    """Scan a local folder for supported image/PDF files."""
+    if not os.path.exists(folder_path):
+        raise FileNotFoundError(f"Folder not found: {folder_path}")
+    if not os.path.isdir(folder_path):
+        raise NotADirectoryError(f"Path is not a folder: {folder_path}")
+
+    files = []
+    walk = os.walk(folder_path) if recursive else [(folder_path, [], os.listdir(folder_path))]
+
+    for root, dirs, filenames in walk:
+        for fname in filenames:
+            if fname.startswith('.'):          # skip hidden files
+                continue
+            ext = os.path.splitext(fname)[1].lower()
+            if ext in SUPPORTED_EXTENSIONS:
+                full_path = os.path.join(root, fname)
+                if os.path.isfile(full_path):
+                    files.append({
+                        "file_id":  f"local_{uuid.uuid4().hex}",
+                        "filename": fname,
+                        "filepath": full_path,
+                        "size":     os.path.getsize(full_path),
+                        "rel_path": os.path.relpath(full_path, folder_path)
+                    })
+
+    files.sort(key=lambda x: x["rel_path"])
+    return files
+
+
+# ── PREVIEW ────────────────────────────────────────────────
+
+@app.post("/bank/folder/preview")
+async def preview_bank_folder(
+    folder_path: str = Form(...),
+    recursive:   str = Form("false")
+):
+    """Preview files that will be processed - no OCR run yet."""
+    try:
+        is_recursive = recursive.lower() in ("true", "1", "yes")
+        files = scan_folder_for_images(folder_path, recursive=is_recursive)
+
+        return JSONResponse(content={
+            "success":       True,
+            "folder_path":   folder_path,
+            "recursive":     is_recursive,
+            "total_files":   len(files),
+            "estimated_cost": f"${len(files) * 0.002:.4f}",
+            "estimated_time_minutes": max(1, math.ceil(len(files) * 3 / 60)),
+            "files": [
+                {"filename": f["filename"], "rel_path": f["rel_path"],
+                 "size_kb": round(f["size"] / 1024, 1)}
+                for f in files
+            ]
+        })
+
+    except (FileNotFoundError, NotADirectoryError) as e:
+        return JSONResponse(status_code=400, content={"success": False, "error": str(e)})
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"success": False, "error": str(e)})
+
+
+# ── START ──────────────────────────────────────────────────
+
+@app.post("/bank/folder/start")
+async def start_bank_folder_extraction(
+    folder_path: str = Form(...),
+    recursive:   str = Form("false")
+):
+    """
+    Start bank OCR for every supported file in a folder.
+    Uses auto_extraction_jobs + auto_extraction_results (existing tables).
+    """
+    if not supabase:
+        return JSONResponse(status_code=500, content={
+            "success": False, "error": "Supabase not configured"
+        })
+
+    try:
+        is_recursive = recursive.lower() in ("true", "1", "yes")
+        files = scan_folder_for_images(folder_path, recursive=is_recursive)
+
+        if not files:
+            return JSONResponse(status_code=400, content={
+                "success": False,
+                "error":   f"No supported files found in: {folder_path}",
+                "supported_formats": sorted(SUPPORTED_EXTENSIONS)
+            })
+
+        job_id = f"bank_folder_{int(time.time())}_{uuid.uuid4().hex[:8]}"
+
+        # ✅ Reuse auto_extraction_jobs table
+        supabase.table("auto_extraction_jobs").insert({
+            "job_id":          job_id,
+            "app_link_name":   "local_folder",   # sentinel value
+            "report_link_name": folder_path,     # store folder path here
+            "bank_field_name": "local_file",
+            "bill_field_name": None,
+            "status":          "pending",
+            "total_records":   len(files),
+            "folder_path":     folder_path       # dedicated column already exists
+        }).execute()
+
+        thread = threading.Thread(
+            target=process_bank_folder_job,
+            args=(job_id, files, folder_path)
+        )
+        thread.daemon = True
+        thread.start()
+
+        return JSONResponse(content={
+            "success":          True,
+            "job_id":           job_id,
+            "status":           "started",
+            "folder_path":      folder_path,
+            "total_files":      len(files),
+            "message":          f"🚀 Processing {len(files)} file(s) from folder",
+            "check_status_url": f"/bank/folder/status/{job_id}",
+            "results_url":      f"/bank/folder/results/{job_id}"
+        })
+
+    except (FileNotFoundError, NotADirectoryError) as e:
+        return JSONResponse(status_code=400, content={"success": False, "error": str(e)})
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        return JSONResponse(status_code=500, content={"success": False, "error": str(e)})
+
+
+# ── BACKGROUND PROCESSOR ───────────────────────────────────
+
+def process_bank_folder_job(job_id: str, files: List[Dict], folder_path: str):
+    """
+    Processes every file and saves to auto_extraction_results.
+    Maps local-file fields onto the existing schema:
+      record_id   → file_id  (unique per file)
+      student_name → filename
+      bank_data   → full OCR result dict
+      status      → success / failed
+    """
+    if not supabase:
+        return
+
+    print(f"\n{'='*80}")
+    print(f"[BANK FOLDER] Job: {job_id}  |  Files: {len(files)}")
+    print(f"{'='*80}\n")
+
+    try:
+        supabase.table("auto_extraction_jobs").update({
+            "status":     "running",
+            "started_at": datetime.now().isoformat()
+        }).eq("job_id", job_id).execute()
+
+        processed = successful = failed = 0
+        total_cost = 0.0
+
+        for idx, file_info in enumerate(files, 1):
+            file_id   = file_info["file_id"]
+            filename  = file_info["filename"]
+            filepath  = file_info["filepath"]
+            rel_path  = file_info["rel_path"]
+            t0 = time.time()
+
+            print(f"[BANK FOLDER] [{idx}/{len(files)}] {rel_path}")
+
+            try:
+                with open(filepath, "rb") as f:
+                    file_content = f.read()
+
+                validation = validate_file_format(file_content, filename)
+                if not validation["valid"]:
+                    raise ValueError(f"Invalid format: {validation['message']}")
+
+                result = process_single_file(file_content, filename, "bank")
+
+                if not result.get("success"):
+                    raise RuntimeError(result.get("error", "OCR failed"))
+
+                tokens = result.get("token_usage", {})
+                cost   = calculate_cost(
+                    tokens.get("input_tokens", 0),
+                    tokens.get("output_tokens", 0),
+                    "gemini_vision"
+                )
+                total_cost    += cost
+                processing_ms  = int((time.time() - t0) * 1000)
+
+                # ✅ Save into auto_extraction_results
+                supabase.table("auto_extraction_results").insert({
+                    "job_id":             job_id,
+                    "record_id":          file_id,        # file_id as record_id
+                    "app_link_name":      "local_folder",
+                    "report_link_name":   folder_path,
+                    "student_name":       filename,       # filename as student_name
+                    "bank_data":          result,         # full OCR result
+                    "bill_data":          None,
+                    "status":             "success",
+                    "processing_time_ms": processing_ms,
+                    "tokens_used":        tokens.get("total_tokens", 0),
+                    "cost_usd":           cost,
+                    "processed_at":       datetime.now().isoformat(),
+                    "rel_path":           rel_path        # column already exists
+                }).execute()
+
+                successful += 1
+                print(f"[BANK FOLDER]   ✅ {result.get('bank_name')} | "
+                      f"A/C: {result.get('account_number')} | "
+                      f"IFSC: {result.get('ifsc_code')} | ${cost:.6f}")
+
+            except Exception as err:
+                failed += 1
+                print(f"[BANK FOLDER]   ✗ {err}")
+                try:
+                    supabase.table("auto_extraction_results").insert({
+                        "job_id":          job_id,
+                        "record_id":       file_id,
+                        "app_link_name":   "local_folder",
+                        "report_link_name": folder_path,
+                        "student_name":    filename,
+                        "status":          "failed",
+                        "error_message":   str(err),
+                        "processed_at":    datetime.now().isoformat(),
+                        "rel_path":        rel_path
+                    }).execute()
+                except Exception:
+                    pass
+
+            processed += 1
+
+            # Update progress
+            try:
+                supabase.table("auto_extraction_jobs").update({
+                    "processed_records":  processed,
+                    "successful_records": successful,
+                    "failed_records":     failed,
+                    "total_cost_usd":     round(total_cost, 6)
+                }).eq("job_id", job_id).execute()
+            except Exception:
+                pass
+
+            time.sleep(0.3)
+
+        supabase.table("auto_extraction_jobs").update({
+            "status":        "completed",
+            "completed_at":  datetime.now().isoformat(),
+            "total_cost_usd": round(total_cost, 6)
+        }).eq("job_id", job_id).execute()
+
+        print(f"\n[BANK FOLDER] ✅ Done | "
+              f"Success: {successful}/{len(files)} | "
+              f"Failed: {failed}/{len(files)} | "
+              f"Cost: ${total_cost:.6f}\n")
+
+    except Exception as e:
+        print(f"[BANK FOLDER] ✗ Job crashed: {e}")
+        import traceback; traceback.print_exc()
+        try:
+            supabase.table("auto_extraction_jobs").update({
+                "status":       "failed",
+                "completed_at": datetime.now().isoformat()
+            }).eq("job_id", job_id).execute()
+        except Exception:
+            pass
+
+
+# ── STATUS ─────────────────────────────────────────────────
+
+@app.get("/bank/folder/status/{job_id}")
+async def get_bank_folder_status(job_id: str):
+    """Poll job progress."""
+    if not supabase:
+        return JSONResponse(status_code=500, content={"success": False, "error": "Supabase not configured"})
+
+    try:
+        resp = supabase.table("auto_extraction_jobs").select("*").eq("job_id", job_id).execute()
+        if not resp.data:
+            return JSONResponse(status_code=404, content={"success": False, "error": "Job not found"})
+
+        job   = resp.data[0]
+        total = job.get("total_records", 0)
+        done  = job.get("processed_records", 0)
+        pct   = round((done / total) * 100, 2) if total else 0
+
+        return JSONResponse(content={
+            "success":     True,
+            "job_id":      job_id,
+            "status":      job["status"],
+            "folder_path": job.get("folder_path"),
+            "progress": {
+                "total_files":      total,
+                "processed_files":  done,
+                "successful_files": job.get("successful_records", 0),
+                "failed_files":     job.get("failed_records", 0),
+                "progress_percent": pct
+            },
+            "cost": {"total_cost_usd": float(job.get("total_cost_usd", 0))},
+            "timestamps": {
+                "created_at":   job.get("created_at"),
+                "started_at":   job.get("started_at"),
+                "completed_at": job.get("completed_at")
+            }
+        })
+
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"success": False, "error": str(e)})
+
+
+# ── RESULTS ────────────────────────────────────────────────
+
+@app.get("/bank/folder/results/{job_id}")
+async def get_bank_folder_results(
+    job_id:        str,
+    limit:         int = 500,
+    status_filter: Optional[str] = None   # "success" | "failed"
+):
+    """Fetch all extraction results for a folder job."""
+    if not supabase:
+        return JSONResponse(status_code=500, content={"success": False, "error": "Supabase not configured"})
+
+    try:
+        query = supabase.table("auto_extraction_results")\
+            .select("id, record_id, student_name, rel_path, status, bank_data, error_message, cost_usd, processing_time_ms, processed_at")\
+            .eq("job_id", job_id)\
+            .order("processed_at", desc=False)\
+            .limit(limit)
+
+        if status_filter:
+            query = query.eq("status", status_filter)
+
+        resp = query.execute()
+
+        # Flatten bank_data fields for easy reading
+        flat_results = []
+        for row in resp.data:
+            bank = row.get("bank_data") or {}
+            flat_results.append({
+                "filename":       row.get("student_name"),
+                "rel_path":       row.get("rel_path"),
+                "status":         row.get("status"),
+                "bank_name":      bank.get("bank_name"),
+                "account_number": bank.get("account_number"),
+                "account_holder": bank.get("account_holder_name"),
+                "ifsc_code":      bank.get("ifsc_code"),
+                "branch_name":    bank.get("branch_name"),
+                "error_message":  row.get("error_message"),
+                "cost_usd":       row.get("cost_usd"),
+                "processing_time_ms": row.get("processing_time_ms")
+            })
+
+        return JSONResponse(content={
+            "success":       True,
+            "job_id":        job_id,
+            "total_results": len(flat_results),
+            "results":       flat_results
+        })
+
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"success": False, "error": str(e)})
 # ============================================================
 # API ENDPOINTS
 # ============================================================
@@ -2984,6 +4434,410 @@ async def fetch_report_fields(
         })
 
 
+# ============================================================
+# ✅ UPDATED: Filter Already-Extracted Records by record_id
+# Works without tracking_id - uses record_id as primary key
+# ============================================================
+
+
+def get_already_extracted_record_ids(
+    app_link_name: str, 
+    report_link_name: str,
+    include_failed: bool = False,
+    include_synced: bool = False
+) -> set:
+    """
+    Get IDs of already extracted AND synced records
+    
+    Args:
+        app_link_name: Zoho app name
+        report_link_name: Zoho report name
+        include_failed: If True, also exclude failed attempts (default: False, only exclude successful)
+        include_synced: If True, include synced records in available pool (default: False, exclude synced)
+    
+    Returns:
+        Set of record_id strings that should be excluded from processing
+    
+    ✅ Excludes:
+        - Successfully extracted records
+        - Records already synced to Creator
+        - (Optionally) Failed extraction attempts
+    """
+    if not supabase:
+        return set()
+    
+    try:
+        print(f"\n[FILTER] Checking for already-extracted records...")
+        print(f"[FILTER] App: {app_link_name} | Report: {report_link_name}")
+        
+        # Query: Get all records for this app/report combination
+        # ✅ ADDED: push_status to detect synced records
+        response = supabase.table("auto_extraction_results")\
+            .select("id, record_id, status, push_status, scholar_id, tracking_id, created_at")\
+            .eq("app_link_name", app_link_name)\
+            .eq("report_link_name", report_link_name)\
+            .execute()
+        
+        if not response.data:
+            print(f"[FILTER] ✅ No previous extractions found - all records are new")
+            return set()
+        
+        all_results = response.data
+        print(f"[FILTER] Found {len(all_results)} total historical records")
+        
+        # Count by status and push_status
+        status_counts = {}
+        push_status_counts = {}
+        
+        for r in all_results:
+            status = r.get("status", "unknown")
+            status_counts[status] = status_counts.get(status, 0) + 1
+            
+            push_status = r.get("push_status", "not_synced")
+            push_status_counts[push_status] = push_status_counts.get(push_status, 0) + 1
+        
+        print(f"[FILTER] Status breakdown:")
+        for status, count in sorted(status_counts.items()):
+            print(f"[FILTER]   Extraction Status - {status}: {count}")
+        
+        print(f"[FILTER] Sync Status breakdown:")
+        for push_status, count in sorted(push_status_counts.items()):
+            print(f"[FILTER]   Sync Status - {push_status}: {count}")
+        
+        # Extract record IDs based on filters
+        already_extracted = set()
+        
+        # ========================================
+        # 1️⃣ ALWAYS exclude successful extractions
+        # ========================================
+        successful_results = [r for r in all_results if r.get("status") == "success"]
+        successful_ids = {str(r["record_id"]) for r in successful_results if r.get("record_id")}
+        already_extracted.update(successful_ids)
+        
+        print(f"[FILTER] ✅ Excluding {len(successful_ids)} successful extractions")
+        
+        # ========================================
+        # 2️⃣ ALWAYS exclude synced records (unless overridden)
+        # ========================================
+        if not include_synced:
+            synced_results = [r for r in all_results if r.get("push_status") == "synced"]
+            synced_ids = {str(r["record_id"]) for r in synced_results if r.get("record_id")}
+            already_extracted.update(synced_ids)
+            
+            print(f"[FILTER] ✅ Excluding {len(synced_ids)} already synced to Zoho Creator")
+            
+            if synced_ids:
+                sample_synced = list(synced_ids)[:3]
+                print(f"[FILTER]    Sample synced IDs: {sample_synced}")
+        else:
+            print(f"[FILTER] ⚠️ Including {push_status_counts.get('synced', 0)} synced records for re-sync")
+        
+        # ========================================
+        # 3️⃣ OPTIONALLY exclude failed attempts
+        # ========================================
+        if include_failed:
+            failed_results = [r for r in all_results if r.get("status") in ["failed", "error"]]
+            failed_ids = {str(r["record_id"]) for r in failed_results if r.get("record_id")}
+            already_extracted.update(failed_ids)
+            print(f"[FILTER] ⚠️ Also excluding {len(failed_ids)} failed extraction attempts")
+            
+            if failed_ids:
+                sample_failed = list(failed_ids)[:3]
+                print(f"[FILTER]    Sample failed IDs: {sample_failed}")
+        else:
+            failed_count = status_counts.get("failed", 0) + status_counts.get("error", 0)
+            print(f"[FILTER] 💡 Including {failed_count} failed records for retry")
+        
+        # ========================================
+        # Diagnostic Summary
+        # ========================================
+        print(f"\n[FILTER] 📊 EXCLUSION SUMMARY")
+        print(f"[FILTER] {'='*60}")
+        print(f"[FILTER] Total extracted (Supabase):  {len(all_results)}")
+        print(f"[FILTER] - Successful:                {len(successful_ids)}")
+        print(f"[FILTER] - Synced to Creator:         {push_status_counts.get('synced', 0)}")
+        print(f"[FILTER] - Failed:                    {status_counts.get('failed', 0)}")
+        print(f"[FILTER] - Other:                     {len(all_results) - len(successful_ids) - push_status_counts.get('synced', 0) - status_counts.get('failed', 0)}")
+        print(f"[FILTER] {'='*60}")
+        print(f"[FILTER] Total to EXCLUDE:            {len(already_extracted)}")
+        print(f"[FILTER] Available for processing:    {1745 - len(already_extracted)}")
+        print(f"[FILTER] {'='*60}\n")
+        
+        return already_extracted
+        
+    except Exception as e:
+        print(f"[FILTER] ✗ Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return set()
+
+
+
+def get_already_extracted_record_ids(
+    app_link_name: str, 
+    report_link_name: str,
+    include_failed: bool = False,
+    include_synced: bool = False
+) -> set:
+    """
+    Get IDs of already extracted AND synced records
+    
+    Args:
+        app_link_name: Zoho app name
+        report_link_name: Zoho report name
+        include_failed: If True, also exclude failed attempts (default: False, only exclude successful)
+        include_synced: If True, include synced records in available pool (default: False, exclude synced)
+    
+    Returns:
+        Set of record_id strings that should be excluded from processing
+    
+    ✅ Excludes:
+        - Successfully extracted records
+        - Records already synced to Creator
+        - (Optionally) Failed extraction attempts
+    """
+    if not supabase:
+        return set()
+    
+    try:
+        print(f"\n[FILTER] Checking for already-extracted records...")
+        print(f"[FILTER] App: {app_link_name} | Report: {report_link_name}")
+        
+        # Query: Get all records for this app/report combination
+        # ✅ ADDED: push_status to detect synced records
+        response = supabase.table("auto_extraction_results")\
+            .select("id, record_id, status, push_status, scholar_id, tracking_id, created_at")\
+            .eq("app_link_name", app_link_name)\
+            .eq("report_link_name", report_link_name)\
+            .execute()
+        
+        if not response.data:
+            print(f"[FILTER] ✅ No previous extractions found - all records are new")
+            return set()
+        
+        all_results = response.data
+        print(f"[FILTER] Found {len(all_results)} total historical records")
+        
+        # Count by status and push_status
+        status_counts = {}
+        push_status_counts = {}
+        
+        for r in all_results:
+            status = r.get("status", "unknown")
+            status_counts[status] = status_counts.get(status, 0) + 1
+            
+            push_status = r.get("push_status", "not_synced")
+            push_status_counts[push_status] = push_status_counts.get(push_status, 0) + 1
+        
+        print(f"[FILTER] Status breakdown:")
+        for status, count in sorted(status_counts.items()):
+            print(f"[FILTER]   Extraction Status - {status}: {count}")
+        
+        print(f"[FILTER] Sync Status breakdown:")
+        for push_status, count in sorted(push_status_counts.items()):
+            print(f"[FILTER]   Sync Status - {push_status}: {count}")
+        
+        # Extract record IDs based on filters
+        already_extracted = set()
+        
+        # ========================================
+        # 1️⃣ ALWAYS exclude successful extractions
+        # ========================================
+        successful_results = [r for r in all_results if r.get("status") == "success"]
+        successful_ids = {str(r["record_id"]) for r in successful_results if r.get("record_id")}
+        already_extracted.update(successful_ids)
+        
+        print(f"[FILTER] ✅ Excluding {len(successful_ids)} successful extractions")
+        
+        # ========================================
+        # 2️⃣ ALWAYS exclude synced records (unless overridden)
+        # ========================================
+        if not include_synced:
+            synced_results = [r for r in all_results if r.get("push_status") == "synced"]
+            synced_ids = {str(r["record_id"]) for r in synced_results if r.get("record_id")}
+            already_extracted.update(synced_ids)
+            
+            print(f"[FILTER] ✅ Excluding {len(synced_ids)} already synced to Zoho Creator")
+            
+            if synced_ids:
+                sample_synced = list(synced_ids)[:3]
+                print(f"[FILTER]    Sample synced IDs: {sample_synced}")
+        else:
+            print(f"[FILTER] ⚠️ Including {push_status_counts.get('synced', 0)} synced records for re-sync")
+        
+        # ========================================
+        # 3️⃣ OPTIONALLY exclude failed attempts
+        # ========================================
+        if include_failed:
+            failed_results = [r for r in all_results if r.get("status") in ["failed", "error"]]
+            failed_ids = {str(r["record_id"]) for r in failed_results if r.get("record_id")}
+            already_extracted.update(failed_ids)
+            print(f"[FILTER] ⚠️ Also excluding {len(failed_ids)} failed extraction attempts")
+            
+            if failed_ids:
+                sample_failed = list(failed_ids)[:3]
+                print(f"[FILTER]    Sample failed IDs: {sample_failed}")
+        else:
+            failed_count = status_counts.get("failed", 0) + status_counts.get("error", 0)
+            print(f"[FILTER] 💡 Including {failed_count} failed records for retry")
+        
+        # ========================================
+        # Diagnostic Summary
+        # ========================================
+        print(f"\n[FILTER] 📊 EXCLUSION SUMMARY")
+        print(f"[FILTER] {'='*60}")
+        print(f"[FILTER] Total extracted (Supabase):  {len(all_results)}")
+        print(f"[FILTER] - Successful:                {len(successful_ids)}")
+        print(f"[FILTER] - Synced to Creator:         {push_status_counts.get('synced', 0)}")
+        print(f"[FILTER] - Failed:                    {status_counts.get('failed', 0)}")
+        print(f"[FILTER] - Other:                     {len(all_results) - len(successful_ids) - push_status_counts.get('synced', 0) - status_counts.get('failed', 0)}")
+        print(f"[FILTER] {'='*60}")
+        print(f"[FILTER] Total to EXCLUDE:            {len(already_extracted)}")
+        print(f"[FILTER] Available for processing:    {1745 - len(already_extracted)}")
+        print(f"[FILTER] {'='*60}\n")
+        
+        return already_extracted
+        
+    except Exception as e:
+        print(f"[FILTER] ✗ Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return set()
+
+
+# ============================================================
+# ✅ UPDATED: fetch_zoho_records_with_dedup
+# Now uses the new filter function
+# ============================================================
+
+def fetch_zoho_records_with_dedup(
+    app_link_name: str, 
+    report_link_name: str,
+    criteria: Optional[str] = None,
+    max_records: int = None,
+    exclude_already_extracted: bool = True,
+    include_failed_retries: bool = False,
+    include_synced_for_retry: bool = False
+) -> tuple:
+    """
+    Fetch records from Zoho Creator with automatic deduplication
+    ✅ Now excludes synced records by default
+    ✅ Supports retry modes for failed and synced records
+    
+    Returns:
+        (records, stats_dict) where stats includes counts and exclusions
+    """
+    try:
+        access_token, token_name = get_zoho_token(scope_needed="read")
+        
+        if not access_token:
+            raise Exception("Failed to get READ token")
+        
+        api_url = f"https://creator.zoho.com/api/v2.1/{app_link_name}/report/{report_link_name}"
+        headers = {"Authorization": f"Zoho-oauthtoken {access_token}"}
+        
+        # Fetch all records (or filtered subset)
+        all_records = []
+        seen_ids = set()
+        page = 1
+        max_id = None
+        
+        print(f"\n{'='*80}")
+        print(f"[ZOHO FETCH] Fetching from {report_link_name}")
+        print(f"[ZOHO FETCH] Deduplication: {exclude_already_extracted}")
+        print(f"[ZOHO FETCH] Retry Failed: {include_failed_retries}")
+        print(f"[ZOHO FETCH] Retry Synced: {include_synced_for_retry}")
+        print(f"{'='*80}\n")
+        
+        while True:
+            if criteria:
+                params = {"criteria": criteria, "from": 1, "limit": 200}
+            else:
+                if max_id is None:
+                    params = {"from": 1, "limit": 200}
+                else:
+                    params = {"criteria": f"ID < {max_id}", "from": 1, "limit": 200}
+            
+            response = requests.get(api_url, headers=headers, params=params, timeout=30)
+            response.raise_for_status()
+            
+            data = response.json()
+            records = data.get("data", [])
+            
+            if not records:
+                break
+            
+            # Extract ID range for next page
+            batch_ids = [int(r.get("ID", 0)) for r in records if r.get("ID")]
+            if batch_ids:
+                max_id = min(batch_ids)
+            
+            # Deduplicate
+            for record in records:
+                record_id = str(record.get("ID", ""))
+                if record_id and record_id not in seen_ids:
+                    seen_ids.add(record_id)
+                    all_records.append(record)
+            
+            print(f"[ZOHO FETCH] Page {page}: Fetched {len(records)} records")
+            
+            if len(records) < 200 or (max_records and len(all_records) >= max_records):
+                break
+            
+            page += 1
+            time.sleep(0.5)
+        
+        print(f"[ZOHO FETCH] ✅ Fetched {len(all_records)} unique records from Zoho\n")
+        
+        # Filter out already extracted (if enabled)
+        stats = {
+            "total_fetched": len(all_records),
+            "excluded_successful": 0,
+            "excluded_synced": 0,
+            "excluded_failed": 0,
+            "total_excluded": 0,
+            "new_count": len(all_records),
+            "final_records": len(all_records),
+            "excluded_ids": []
+        }
+        
+        if exclude_already_extracted:
+            already_extracted = get_already_extracted_record_ids(
+                app_link_name,
+                report_link_name,
+                include_failed=include_failed_retries,
+                include_synced=include_synced_for_retry
+            )
+            
+            if already_extracted:
+                original_count = len(all_records)
+                all_records = [r for r in all_records if str(r.get("ID", "")) not in already_extracted]
+                excluded_count = original_count - len(all_records)
+                
+                stats["total_excluded"] = excluded_count
+                stats["new_count"] = len(all_records)
+                stats["final_records"] = len(all_records)
+                stats["excluded_ids"] = list(already_extracted)[:10]  # Sample
+                
+                print(f"[FILTER] Excluded {excluded_count} already-processed records")
+                print(f"[FILTER] New records to process: {len(all_records)}\n")
+        
+        # Apply max_records limit
+        if max_records and len(all_records) > max_records:
+            all_records = all_records[:max_records]
+        
+        return all_records, stats
+        
+    except Exception as e:
+        print(f"[ZOHO FETCH] ✗ Error: {e}")
+        raise
+
+
+# ============================================================
+# ✅ UPDATED: Auto-Extract Preview 
+# Now shows synced record exclusion
+# ============================================================
+
 @app.post("/ocr/auto-extract/preview")
 async def preview_extraction(
     app_link_name: str = Form(...),
@@ -2993,115 +4847,86 @@ async def preview_extraction(
     filter_criteria: Optional[str] = Form(None),
     store_images: str = Form("false"),
     fetch_all: str = Form("false"),
-    include_already_extracted: str = Form("false"),
-    max_records_limit: int = Form(1000)
+    exclude_already_extracted: str = Form("true"),
+    include_failed_retries: str = Form("false"),
+    include_synced_for_retry: str = Form("false"),  # ✅ NEW
+    max_records_limit: int = Form(1000),
+    selected_fields: Optional[str] = Form(None)
 ):
-    """Preview records for extraction - SMART calculation"""
+    """
+    Preview records for extraction - WITH FULL DEDUPLICATION
+    
+    ✅ NEW: include_synced_for_retry parameter to re-sync synced records
+    ✅ Excludes: Successful + Synced + (Optional) Failed records
+    """
     try:
         print(f"[PREVIEW] Loading records from {report_link_name}...")
 
+        # Parse options
+        exclude_extracted = exclude_already_extracted.lower() in ('true', '1', 'yes')
+        include_failed = include_failed_retries.lower() in ('true', '1', 'yes')
+        include_synced = include_synced_for_retry.lower() in ('true', '1', 'yes')
+
+        # Parse filters
         zoho_criteria = None
         if filter_criteria:
             try:
                 filters = json.loads(filter_criteria)
                 zoho_criteria = convert_filters_to_zoho_criteria(filters)
-                print(f"[PREVIEW] 🔍 Converted filters to: {zoho_criteria}")
+                print(f"[PREVIEW] 🔍 Filter criteria: {zoho_criteria}")
             except Exception as e:
                 print(f"[PREVIEW] ⚠️ Filter error: {e}")
                 if isinstance(filter_criteria, str) and filter_criteria.strip():
                     zoho_criteria = filter_criteria
         
-        fetch_all_bool = fetch_all.lower() in ('true', '1', 'yes')
-        include_already_extracted_bool = include_already_extracted.lower() in ('true', '1', 'yes')
+        # ✅ UPDATED: Fetch with deduplication including synced records
+        records, fetch_stats = fetch_zoho_records_with_dedup(
+            app_link_name=app_link_name,
+            report_link_name=report_link_name,
+            criteria=zoho_criteria,
+            max_records=max_records_limit,
+            exclude_already_extracted=exclude_extracted,
+            include_failed_retries=include_failed,
+            include_synced_for_retry=include_synced  # ✅ NEW
+        )
 
-        # Get already extracted count
-        already_extracted = set()
-        if not include_already_extracted_bool:
-            already_extracted = get_already_extracted_record_ids(app_link_name, report_link_name)
-            print(f"[FILTER] Found {len(already_extracted)} already extracted")
+        print(f"[PREVIEW] ✅ After filtering: {len(records)} records ready")
+
+        # Parse selected fields
+        fields_to_fetch = []
+        if selected_fields:
+            try:
+                fields_to_fetch = json.loads(selected_fields)
+                print(f"[PREVIEW] 🎯 User selected {len(fields_to_fetch)} fields")
+            except Exception as e:
+                print(f"[PREVIEW] ⚠️ Failed to parse fields: {e}")
         
-        target_new = max_records_limit if fetch_all_bool else 1000
-        
-        # ✅ SMART CALCULATION:
-        # Fetch a sample first to estimate extraction rate
-        sample_size = 200
-        sample_records = fetch_zoho_records(
-            app_link_name=app_link_name,
-            report_link_name=report_link_name,
-            criteria=zoho_criteria,
-            max_records=sample_size
-        )
-        
-        # Check extraction rate in sample
-        sample_new = [r for r in sample_records if str(r.get("ID", "")) not in already_extracted]
-        extraction_rate = len(sample_new) / len(sample_records) if len(sample_records) > 0 else 1.0
-        
-        print(f"[PREVIEW] Sample: {len(sample_new)}/{len(sample_records)} are new ({extraction_rate*100:.1f}%)")
-        
-        # Calculate how many total records to fetch
-        if extraction_rate > 0:
-            # Add 20% safety margin
-            fetch_count = int(target_new / extraction_rate * 1.2)
-        else:
-            fetch_count = target_new * 3  # Conservative fallback
-        
-        # Cap at reasonable limit
-        fetch_count = min(fetch_count, 5000)
-        
-        print(f"[PREVIEW] Fetching {fetch_count} records to get {target_new} new ones")
-        
-        # Fetch full batch
-        records = fetch_zoho_records(
-            app_link_name=app_link_name,
-            report_link_name=report_link_name,
-            criteria=zoho_criteria,
-            max_records=fetch_count
-        )
-        
-        total_fetched = len(records)
-        
-        # Filter out already extracted
-        if already_extracted:
-            original_count = len(records)
-            records = [r for r in records if str(r.get("ID", "")) not in already_extracted]
-            excluded_count = original_count - len(records)
-            print(f"[FILTER] Excluded {excluded_count} already extracted from {original_count} fetched")
-        
-        # Limit to target
-        if len(records) > target_new:
-            records = records[:target_new]
-        
-        print(f"[PREVIEW] ✅ Loaded {len(records)} NEW records (fetched {total_fetched} total)")
-        
-        # Build preview records (same as before)
+        # Extract image URLs
+        def extract_image_url(field_value):
+            if not field_value:
+                return None
+            if isinstance(field_value, str) and field_value.startswith(('http', '/api/v2.1/')):
+                return field_value
+            elif isinstance(field_value, list) and len(field_value) > 0:
+                first = field_value[0]
+                if isinstance(first, str) and first.startswith(('http', '/api/v2.1/')):
+                    return first
+                elif isinstance(first, dict) and first.get("download_url"):
+                    return first["download_url"]
+            elif isinstance(field_value, dict) and field_value.get("download_url"):
+                return field_value["download_url"]
+            return None
+
         def extract_name(record):
             for field in ["Name", "Student_Name", "Scholar_Name"]:
                 name_value = record.get(field)
                 if isinstance(name_value, str):
                     return name_value
-                if isinstance(name_value, dict):
-                    if name_value.get("zc_display_value"):
-                        return name_value["zc_display_value"]
+                if isinstance(name_value, dict) and name_value.get("zc_display_value"):
+                    return name_value["zc_display_value"]
             return "Unknown"
-        
-        def extract_image_url(field_value):
-            if not field_value:
-                return None
-            
-            if isinstance(field_value, str):
-                if field_value.startswith(('http', '/api/v2.1/')):
-                    return field_value
-            elif isinstance(field_value, list) and len(field_value) > 0:
-                first_item = field_value[0]
-                if isinstance(first_item, str) and first_item.startswith(('http', '/api/v2.1/')):
-                    return first_item
-                elif isinstance(first_item, dict) and first_item.get("download_url"):
-                    return first_item["download_url"]
-            elif isinstance(field_value, dict) and field_value.get("download_url"):
-                return field_value["download_url"]
-            
-            return None
-        
+
+        # Build preview
         preview_records = []
         for record in records:
             record_id = str(record.get("ID", ""))
@@ -3110,33 +4935,52 @@ async def preview_extraction(
             bank_value = record.get(bank_field_name) if bank_field_name else None
             bill_value = record.get(bill_field_name) if bill_field_name else None
             
-            bank_url = extract_image_url(bank_value)
-            bill_url = extract_image_url(bill_value)
-            
-            preview_records.append({
+            preview_record = {
                 "record_id": record_id,
                 "student_name": student_name,
-                "has_bank_image": bank_url is not None,
-                "has_bill_image": bill_url is not None
-            })
+                "has_bank_image": extract_image_url(bank_value) is not None,
+                "has_bill_image": extract_image_url(bill_value) is not None
+            }
+            
+            if fields_to_fetch:
+                for field in fields_to_fetch:
+                    value = record.get(field)
+                    if isinstance(value, dict):
+                        preview_record[field] = value.get("zc_display_value", str(value))
+                    else:
+                        preview_record[field] = value
+            
+            preview_records.append(preview_record)
         
+        # Response with detailed stats
         return JSONResponse(content={
             "success": True,
             "total_records": len(preview_records),
-            "total_fetched_from_zoho": total_fetched,
-            "already_extracted_count": len(already_extracted),
+            "total_fetched_from_zoho": fetch_stats["total_fetched"],
+            "total_excluded": fetch_stats["total_excluded"],
+            "new_records_count": fetch_stats["new_count"],
+            "sample_excluded_ids": fetch_stats["excluded_ids"],
+            "selected_fields": fields_to_fetch,
             "sample_records": preview_records,
             "estimated_cost": f"${len(preview_records) * 0.003:.4f}",
-            "estimated_time_minutes": math.ceil(len(preview_records) * 3 / 60)
+            "estimated_time_minutes": math.ceil(len(preview_records) * 3 / 60),
+            "deduplication_applied": exclude_extracted,
+            "include_failed_for_retry": include_failed,
+            "include_synced_for_retry": include_synced  # ✅ NEW
         })
         
     except Exception as e:
         print(f"[PREVIEW] ✗ Error: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return JSONResponse(status_code=500, content={
             "success": False,
             "error": str(e)
         })
 
+# ============================================================
+# HELPER: Updated start extraction to pass selected fields
+# ============================================================
 
 @app.post("/ocr/auto-extract/start")
 async def start_extraction(
@@ -3145,9 +4989,10 @@ async def start_extraction(
     bank_field_name: Optional[str] = Form(None),
     bill_field_name: Optional[str] = Form(None),
     filter_criteria: Optional[str] = Form(None),
-    selected_record_ids: Optional[str] = Form(None)
+    selected_record_ids: Optional[str] = Form(None),
+    selected_fields: Optional[str] = Form(None)  # ✅ NEW: Pass selected fields
 ):
-    """Start extraction job"""
+    """Start extraction job with selected fields"""
     if not supabase:
         return JSONResponse(status_code=500, content={
             "success": False,
@@ -3155,7 +5000,6 @@ async def start_extraction(
         })
     
     try:
-        # ✅ All lines below 'try:' should have 8 spaces (2 levels of indentation)
         zoho_criteria = None
         if filter_criteria:
             try:
@@ -3205,7 +5049,8 @@ async def start_extraction(
             "bank_field_name": bank_field_name,
             "bill_field_name": bill_field_name,
             "filter_criteria": zoho_criteria,
-            "selected_record_ids": selected_ids
+            "selected_record_ids": selected_ids,
+            "selected_fields": selected_fields  # ✅ NEW: Store selected fields in config
         }
         
         supabase.table("auto_extraction_jobs").insert({
@@ -3214,8 +5059,9 @@ async def start_extraction(
             "report_link_name": report_link_name,
             "bank_field_name": bank_field_name,
             "bill_field_name": bill_field_name,
-            "filter_criteria": zoho_criteria,  # ✅ ALSO CHANGE THIS to zoho_criteria
-            "status": "pending"
+            "filter_criteria": zoho_criteria,
+            "selected_fields": selected_fields,
+            "status": "pending"  # ✅ NEW: Store in Supabase
         }).execute()
         
         thread = threading.Thread(
@@ -3239,6 +5085,7 @@ async def start_extraction(
             "error": str(e)
         })
 
+    
 @app.get("/ocr/auto-extract/status/{job_id}")
 async def get_job_status(job_id: str):
     """Get extraction job status"""
@@ -3619,125 +5466,75 @@ async def get_zoho_form_fields(request: ZohoConfigRequest):
 
 @app.post("/zoho/dynamic-push")
 async def dynamic_push_to_zoho(request: DynamicPushRequest):
-    """Start Zoho push job (returns immediately, processes in background)"""
+    """
+    Push records to Zoho Creator using existing zoho_bulk_api.py
+    This uses the proven field mapping from zoho_bulk_api.py
+    (Tracking_ID, Bill1-5_Amount, formatted Bill_Data, etc.)
+    """
     try:
-        job_id = f"zoho_push_{int(time.time())}_{uuid.uuid4().hex[:8]}"
+        if not supabase:
+            return JSONResponse(status_code=400, content={
+                "success": False,
+                "error": "Supabase not configured"
+            })
         
         print(f"\n{'='*80}")
-        print(f"[ZOHO PUSH] Creating Job: {job_id}")
-        print(f"[ZOHO PUSH] Records to push: {len(request.record_ids)}")
+        print(f"DYNAMIC PUSH TO ZOHO")
+        print(f"{'='*80}")
+        print(f"Records to push: {len(request.record_ids)}")
+        print(f"Record IDs: {request.record_ids[:5]}...")  # Show first 5
         print(f"{'='*80}\n")
         
-        # Initialize job
-        with zoho_push_lock:
-            zoho_push_jobs[job_id] = {
-                "job_id": job_id,
-                "status": "pending",
-                "total_records": len(request.record_ids),
-                "processed_records": 0,
-                "successful_records": 0,
-                "failed_records": 0,
-                "errors": [],
-                "started_at": None,
-                "completed_at": None
-            }
+        # Convert record_ids to strings
+        record_ids_str = [str(rid) for rid in request.record_ids]
         
-        # Start background thread
-        config = {
-            "record_ids": request.record_ids,
-            "config": request.config.dict()
-        }
+        # Fetch full records from Supabase
+        records = []
+        for record_id in record_ids_str:
+            try:
+                response = supabase.table('auto_extraction_results')\
+                    .select('*')\
+                    .eq('id', record_id)\
+                    .execute()
+                
+                if response.data and len(response.data) > 0:
+                    records.append(response.data[0])
+                else:
+                    print(f"⚠️  Record {record_id} not found")
+            except Exception as fetch_error:
+                print(f"❌ Error fetching record {record_id}: {fetch_error}")
         
-        thread = threading.Thread(
-            target=process_zoho_push_job,
-            args=(job_id, config)
-        )
-        thread.daemon = True
-        thread.start()
+        if not records:
+            return JSONResponse(status_code=400, content={
+                "success": False,
+                "error": "No valid records found"
+            })
+        
+        print(f"✅ Successfully fetched {len(records)} records from Supabase")
+        
+        # Use existing zoho_bulk_api.py - proven to work!
+        result = zoho_bulk.bulk_insert(records)
+        
+        print(f"\n{'='*80}")
+        print(f"PUSH RESULT")
+        print(f"{'='*80}")
+        print(f"✅ Successful: {result['successful']}/{result['total_records']}")
+        print(f"❌ Failed: {result['failed']}/{result['total_records']}")
+        print(f"{'='*80}\n")
         
         return JSONResponse(content={
-            "success": True,
-            "job_id": job_id,
-            "status": "started",
-            "message": f"🚀 Pushing {len(request.record_ids)} records to Zoho",
-            "check_status_url": f"/zoho/push-status/{job_id}"
+            "success": result['successful'] > 0,
+            "details": result
         })
         
     except Exception as e:
-        print(f"[ZOHO PUSH] ✗ Error starting job: {e}")
+        print(f"❌ Dynamic push error: {e}")
+        import traceback
+        traceback.print_exc()
         return JSONResponse(status_code=500, content={
             "success": False,
             "error": str(e)
         })
-
-
-
-@app.get("/zoho/push-status/{job_id}")
-async def get_zoho_push_status(job_id: str):
-    """Get Zoho push job status (from in-memory storage)"""
-    try:
-        with zoho_push_lock:
-            if job_id not in zoho_push_jobs:
-                return JSONResponse(status_code=404, content={
-                    "success": False,
-                    "error": "Job not found"
-                })
-            
-            job = zoho_push_jobs[job_id].copy()  # Copy to avoid holding lock
-        
-        progress_percent = 0
-        if job.get("total_records", 0) > 0:
-            progress_percent = round(
-                (job.get("processed_records", 0) / job["total_records"]) * 100, 2
-            )
-        
-        return JSONResponse(content={
-            "success": True,
-            "job_id": job_id,
-            "status": job["status"],
-            "progress": {
-                "total_records": job.get("total_records", 0),
-                "processed_records": job.get("processed_records", 0),
-                "successful_records": job.get("successful_records", 0),
-                "failed_records": job.get("failed_records", 0),
-                "progress_percent": progress_percent
-            },
-            "errors": job.get("errors", [])[:5],  # Show first 5 errors
-            "timestamps": {
-                "started_at": job.get("started_at"),
-                "completed_at": job.get("completed_at")
-            }
-        })
-        
-    except Exception as e:
-        return JSONResponse(status_code=500, content={
-            "success": False,
-            "error": str(e)
-        })
-
-
-@app.get("/zoho/push-jobs")
-async def list_zoho_push_jobs():
-    """List all Zoho push jobs (from memory)"""
-    try:
-        with zoho_push_lock:
-            jobs = list(zoho_push_jobs.values())
-        
-        # Sort by started_at (most recent first)
-        jobs.sort(key=lambda x: x.get("started_at", ""), reverse=True)
-        
-        return JSONResponse(content={
-            "success": True,
-            "total_jobs": len(jobs),
-            "jobs": jobs[:20]  # Return last 20 jobs
-        })
-        
-    except Exception as e:
-        return JSONResponse(status_code=500, content={
-            "success": False,
-            "error": str(e)
-        })
-
 
 
 def get_nested_value(obj: dict, path: str):
