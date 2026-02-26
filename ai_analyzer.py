@@ -35,6 +35,21 @@ except ImportError:
     print("[AI Config] ⚠️ PDF support disabled - install: pip3 install pdf2image")
     print("[AI Config] ⚠️ Also install poppler: brew install poppler (macOS)")
 
+
+# ============================================================
+# ADD/REPLACE in ai_analyzer.py
+# ============================================================
+
+# ── Try PPTX support at module level (alongside existing imports) ──
+try:
+    from pptx import Presentation
+    from pptx.util import Inches
+    PPTX_SUPPORT = True
+    print("[AI Config] ✓ PPTX support enabled (python-pptx)")
+except ImportError:
+    PPTX_SUPPORT = False
+    print("[AI Config] ⚠️ PPTX support disabled - install: pip install python-pptx")
+
 load_dotenv()
 
 # Detect which AI service is available
@@ -445,6 +460,14 @@ RULES:
         # Parse response
         response_text = response.text.replace("```json", "").replace("```", "").strip()
         data = json.loads(response_text)
+
+                # ✅ FIX: Handle case where Gemini returns a list instead of dict
+        if isinstance(data, list):
+            print(f"[GEMINI VISION] ⚠️ Received array response, taking first element")
+            data = data[0] if data else {}
+
+        if not isinstance(data, dict):
+            data = {}
         
         print(f"[GEMINI VISION] ✓ Extracted bank details")
         print(f"[GEMINI VISION]   Bank: {data.get('bank_name')}")
@@ -568,6 +591,149 @@ Return ONLY JSON:
         raise
 
 
+# ============================================================
+# ADD THIS FUNCTION to ai_analyzer.py
+# Place it right after analyze_bill_gemini_vision()
+# ============================================================
+
+def analyze_bill_multi_page(file_content: bytes, filename: str) -> List[Dict[str, Any]]:
+    """
+    Extract bills from a PDF that may contain MULTIPLE bills (one per page).
+    
+    - Single-page PDFs / plain images → returns a list with 1 bill dict
+    - Multi-page PDFs                 → returns a list with N bill dicts
+                                        (index 0 = bill1, index 1 = bill2, …)
+    
+    Each dict is the same shape as analyze_bill_gemini_vision() output:
+    {
+        "student_name": ...,
+        "college_name": ...,
+        "roll_number": ...,
+        "receipt_number": ...,
+        "class_course": ...,
+        "bill_date": ...,
+        "amount": ...,
+        "page_number": 1          # which page this bill came from
+    }
+    """
+    if not USE_GEMINI:
+        raise Exception("Gemini Vision not available - add GEMINI_API_KEY to .env")
+
+    print(f"[BILL MULTI-PAGE] Starting: {filename}")
+
+    try:
+        from google.genai import types
+
+        # ─── Check if it's a PDF ──────────────────────────────────
+        is_pdf = (
+            file_content[:4] == b'%PDF'
+            or file_content[:5] == b'\x0a%PDF'
+        )
+
+        if is_pdf:
+            print(f"[BILL MULTI-PAGE] 📄 PDF detected – converting all pages")
+            if not PDF_SUPPORT:
+                raise Exception(
+                    "PDF support not installed. "
+                    "Run: pip3 install pdf2image && brew install poppler"
+                )
+            images_to_process = convert_pdf_to_images(file_content)
+            print(f"[BILL MULTI-PAGE] {len(images_to_process)} page(s) extracted from PDF")
+        else:
+            print(f"[BILL MULTI-PAGE] 🖼️ Single image – treating as one bill")
+            optimized, mime_type = validate_and_optimize_image_single(file_content, filename)
+            images_to_process = [(optimized, mime_type)]
+
+        # ─── Bill extraction prompt ───────────────────────────────
+        BILL_PROMPT = """
+Extract details from this Indian college fee receipt/bill.
+
+FIND:
+1. **Student Name**: Look for "Name:" field (may be handwritten)
+2. **Date**: Convert to YYYY-MM-DD format
+3. **Total Amount**: Bottom of itemized list (extract number only)
+4. **College Name**: Usually at top in large text
+5. **Receipt Number**: Look for "Receipt No:", "Challan No:"
+
+RULES:
+- For amounts like "18000-00", extract as 18000
+- Student name is in "Name" field, NOT signature
+- Date format: YYYY-MM-DD
+- If the page is blank or not a bill, return amount as null
+
+Return ONLY JSON:
+{
+    "student_name": "name or null",
+    "college_name": "name or null",
+    "roll_number": "number or null",
+    "receipt_number": "number or null",
+    "class_course": "course or null",
+    "bill_date": "YYYY-MM-DD or null",
+    "amount": 18000.00
+}
+"""
+
+        # ─── Process each page ────────────────────────────────────
+        bills: List[Dict[str, Any]] = []
+        skipped = 0
+
+        for page_idx, (image_bytes, mime_type) in enumerate(images_to_process, 1):
+            print(f"[BILL MULTI-PAGE] [{page_idx}/{len(images_to_process)}] Extracting bill from page…")
+
+            try:
+                response = genai_client.models.generate_content(
+                    model=GEMINI_MODEL,
+                    contents=[
+                        types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+                        BILL_PROMPT,
+                    ],
+                    config=types.GenerateContentConfig(
+                        temperature=0.1,
+                        response_mime_type="application/json",
+                    ),
+                )
+
+                response_text = response.text.replace("```json", "").replace("```", "").strip()
+                data = json.loads(response_text)
+
+                # Normalise to dict (Gemini occasionally wraps in a list)
+                if isinstance(data, list):
+                    data = data[0] if data else {}
+                if not isinstance(data, dict):
+                    data = {}
+
+                # Stamp which page this came from
+                data["page_number"] = page_idx
+
+                # Skip pages that look blank / are not bills
+                if data.get("amount") is None and data.get("college_name") is None:
+                    print(f"[BILL MULTI-PAGE]   ⚠️ Page {page_idx} appears blank or not a bill – skipping")
+                    skipped += 1
+                    continue
+
+                print(f"[BILL MULTI-PAGE]   ✅ Page {page_idx}: "
+                      f"College={data.get('college_name')} | "
+                      f"Student={data.get('student_name')} | "
+                      f"Amount=₹{data.get('amount')}")
+
+                bills.append(data)
+
+            except json.JSONDecodeError as e:
+                print(f"[BILL MULTI-PAGE]   ✗ Page {page_idx}: JSON parse error – {e}")
+            except Exception as e:
+                print(f"[BILL MULTI-PAGE]   ✗ Page {page_idx}: {e}")
+                import traceback; traceback.print_exc()
+
+        print(f"\n[BILL MULTI-PAGE] Done – {len(bills)} bill(s) extracted"
+              f" ({skipped} page(s) skipped)")
+
+        return bills
+
+    except Exception as e:
+        print(f"[BILL MULTI-PAGE] ✗ Fatal error: {e}")
+        import traceback; traceback.print_exc()
+        raise
+        
 def extract_bank_details_from_markdown(markdown_text: str) -> dict:
     """Regex-based bank extraction (fallback)"""
     print(f"[MANUAL EXTRACTION] Parsing bank markdown...")
@@ -858,7 +1024,7 @@ def convert_pdf_to_images(file_content: bytes) -> List[Tuple[bytes, str]]:
     
     try:
         # Convert ALL pages (not just first page)
-        images = convert_from_bytes(file_content, dpi=200)
+        images = convert_from_bytes(file_content, dpi=300)
         
         if not images:
             raise Exception("Failed to convert PDF - no pages found")
@@ -1155,49 +1321,146 @@ Return ONLY this JSON:
         }
 
 
+def split_image_into_tiles(image_bytes: bytes, rows: int = 3, cols: int = 2) -> List[Tuple[bytes, str]]:
+    """
+    Split a single page image into a grid of tiles.
+    Default: 3 rows × 2 cols = 6 tiles per page.
+    Each tile is sent to Gemini separately → fewer barcodes per call → fewer missed reads.
+    """
+    img = Image.open(io.BytesIO(image_bytes))
+    w, h = img.size
+
+    tile_w = w // cols
+    tile_h = h // rows
+
+    tiles = []
+    for r in range(rows):
+        for c in range(cols):
+            left   = c * tile_w
+            upper  = r * tile_h
+            right  = left + tile_w  if c < cols - 1 else w
+            lower  = upper + tile_h if r < rows - 1 else h
+
+            tile = img.crop((left, upper, right, lower))
+
+            if tile.mode != 'RGB':
+                tile = tile.convert('RGB')
+
+            out = io.BytesIO()
+            tile.save(out, format='JPEG', quality=95, optimize=True)
+            tiles.append((out.getvalue(), "image/jpeg"))
+
+    print(f"[TILE SPLIT] Split into {len(tiles)} tiles ({rows}r × {cols}c), each ~{tile_w}×{tile_h}px")
+    return tiles
+
+
+def deduplicate_barcodes(barcodes: List[Dict]) -> List[Dict]:
+    """
+    Remove duplicate barcodes (same data value).
+    Keeps first occurrence (lowest page/tile).
+    """
+    seen = set()
+    unique = []
+    for bc in barcodes:
+        key = bc.get('data', '').strip()
+        if key and key.lower() != 'none' and key not in seen:
+            seen.add(key)
+            unique.append(bc)
+    return unique
+
+
+def extract_barcodes_from_image_tiled(
+    image_bytes: bytes,
+    mime_type: str,
+    page_idx: int,
+    rows: int = 3,
+    cols: int = 2
+) -> List[Dict]:
+    """
+    Extract barcodes from a single page by splitting into tiles first.
+    Each tile is sent to Gemini separately → more reliable extraction.
+    Returns deduplicated list of barcodes found across all tiles.
+    """
+    from google.genai import types
+
+    PROMPT = """
+You are a barcode scanner. Find and extract ALL barcodes visible in this image tile.
+
+Return ONLY this JSON:
+{
+    "barcodes": [
+        {"type": "Code 128", "data": "CT270192855IN"},
+        {"type": "Code 128", "data": "CT270192974IN"}
+    ]
+}
+
+- If no barcodes are found, return: {"barcodes": []}
+- Do NOT skip any barcode, even partial ones
+- Extract the data exactly as printed
+"""
+
+    tiles = split_image_into_tiles(image_bytes, rows=rows, cols=cols)
+    page_barcodes = []
+
+    for tile_idx, (tile_bytes, tile_mime) in enumerate(tiles, 1):
+        try:
+            response = genai_client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=[
+                    types.Part.from_bytes(data=tile_bytes, mime_type=tile_mime),
+                    PROMPT,
+                ],
+                config=types.GenerateContentConfig(
+                    temperature=0.1,
+                    response_mime_type="application/json",
+                ),
+            )
+
+            raw = response.text.replace("```json", "").replace("```", "").strip()
+            data = json.loads(raw)
+
+            if isinstance(data, list):
+                data = {"barcodes": data}
+            if not isinstance(data, dict):
+                data = {"barcodes": []}
+
+            tile_barcodes = data.get("barcodes", [])
+
+            # Tag each barcode with page + tile info
+            for bc in tile_barcodes:
+                bc["page"] = page_idx
+                bc["tile"] = tile_idx
+
+            print(f"[TILE] Page {page_idx}, Tile {tile_idx}/{len(tiles)}: {len(tile_barcodes)} barcodes")
+            page_barcodes.extend(tile_barcodes)
+
+        except json.JSONDecodeError as e:
+            print(f"[TILE] Page {page_idx}, Tile {tile_idx}: JSON error - {e}")
+        except Exception as e:
+            print(f"[TILE] Page {page_idx}, Tile {tile_idx}: Error - {e}")
+
+    # Deduplicate (tiles may overlap slightly at edges)
+    unique = deduplicate_barcodes(page_barcodes)
+    print(f"[TILE] Page {page_idx}: {len(page_barcodes)} raw → {len(unique)} unique barcodes")
+    return unique
+
 
 def analyze_barcode_gemini_vision(file_content: bytes, filename: str) -> Dict[str, Any]:
     """
-    ✅ UPDATED: Extract ALL barcodes from single images and multi-page PDFs
-    
-    Features:
-    - Handles single images and multi-page PDFs
-    - Extracts EVERY barcode found (not just the first)
-    - Validates and optimizes images before processing
-    - Returns comprehensive barcode data with page info
-    - Includes token usage tracking
-    
-    Returns:
-    {
-        "success": True,
-        "filename": "...",
-        "is_multipage": False,
-        "total_pages_processed": 1,
-        "barcode_type": "Code 128",  # Primary (for compatibility)
-        "barcode_data": "CT270168007IN",  # Primary (for compatibility)
-        "total_barcodes_found": 3,
-        "all_barcodes": [  # ✅ NEW: ALL barcodes with page info
-            {"type": "Code 128", "data": "CT270168007IN", "page": 1},
-            {"type": "QR Code", "data": "https://example.com", "page": 1},
-            {"type": "EAN-13", "data": "5901234123457", "page": 2}
-        ],
-        "confidence": "high",
-        "method": "gemini_vision",
-        "token_usage": {...}
-    }
+    ✅ UPDATED: Extract ALL barcodes using tiled approach for accuracy.
+    Each page is split into a 3×2 grid, each tile processed separately.
+    Results are deduplicated before returning.
     """
     if not USE_GEMINI:
         raise Exception("Gemini Vision not available - add GEMINI_API_KEY to .env")
-    
-    print(f"[BARCODE EXTRACTION] Starting: {filename}")
-    
+
+    print(f"[BARCODE EXTRACTION] Starting (tiled mode): {filename}")
+
     try:
         from google.genai import types
-        
-        # Check if file is PDF
+
         is_pdf = file_content[:4] == b'%PDF' or file_content[:5] == b'\x0a%PDF'
-        
-        # Convert PDF to images or validate single image
+
         if is_pdf:
             print(f"[BARCODE EXTRACTION] 📄 Multi-page PDF detected")
             images_to_process = convert_pdf_to_images(file_content)
@@ -1205,160 +1468,64 @@ def analyze_barcode_gemini_vision(file_content: bytes, filename: str) -> Dict[st
             print(f"[BARCODE EXTRACTION] 🖼️ Single image file")
             optimized, mime_type = validate_and_optimize_image_single(file_content, filename)
             images_to_process = [(optimized, mime_type)]
-        
-        print(f"[BARCODE EXTRACTION] Processing {len(images_to_process)} image(s)...")
-        
+
+        print(f"[BARCODE EXTRACTION] Processing {len(images_to_process)} page(s) with tiling...")
+
         all_barcodes = []
         total_pages_processed = 0
-        
-        # Process each image/page
+
         for page_idx, (image_bytes, mime_type) in enumerate(images_to_process, 1):
-            print(f"\n[BARCODE EXTRACTION] [{page_idx}/{len(images_to_process)}] Processing page/image...")
-            
-            try:
-                # ✅ IMPROVED PROMPT - Extract ALL barcodes, not just first
-                prompt = """
-You are a barcode/QR code scanner. Extract ALL barcodes from this image.
+            print(f"\n[BARCODE EXTRACTION] ── Page {page_idx}/{len(images_to_process)} ──")
 
-CRITICAL INSTRUCTIONS:
-- Find and extract EVERY barcode in the image, no matter how many
-- For each barcode, extract the type (Code 128, EAN-13, QR Code, UPC, Codabar, etc.) and the exact data
-- Return ALL barcodes found, even if there are many (5, 9, 12, 18+)
-- If no barcodes found, return empty array
-- Do NOT skip any barcodes
+            page_barcodes = extract_barcodes_from_image_tiled(
+                image_bytes, mime_type, page_idx,
+                rows=3, cols=2   # ← Tune this: more tiles = more accurate but slower
+            )
 
-Return ONLY this JSON:
-{
-    "page": 1,
-    "total_barcodes_on_page": 3,
-    "barcodes": [
-        {"type": "Code 128", "data": "CT270168007IN"},
-        {"type": "Code 128", "data": "CT270168136IN"},
-        {"type": "QR Code", "data": "https://example.com"}
-    ]
-}
-"""
-                
-                # Call Gemini Vision API
-                response = genai_client.models.generate_content(
-                    model=GEMINI_MODEL,
-                    contents=[
-                        types.Part.from_bytes(
-                            data=image_bytes,
-                            mime_type=mime_type
-                        ),
-                        prompt
-                    ],
-                    config=types.GenerateContentConfig(
-                        temperature=0.1,
-                        response_mime_type="application/json"
-                    )
-                )
-                
-                # Parse response
-                response_text = response.text.replace("```json", "").replace("```", "").strip()
-                data = json.loads(response_text)
-                
-                # Handle various response formats
-                if isinstance(data, list):
-                    data = {
-                        "page": page_idx,
-                        "total_barcodes_on_page": len(data),
-                        "barcodes": data
-                    }
-                elif not isinstance(data, dict):
-                    data = {
-                        "page": page_idx,
-                        "total_barcodes_on_page": 0,
-                        "barcodes": []
-                    }
-                
-                # Ensure barcodes field exists
-                if 'barcodes' not in data:
-                    data['barcodes'] = []
-                
-                page_barcodes = data.get('barcodes', [])
-                
-                print(f"[BARCODE EXTRACTION]   ✅ Page {page_idx}: Found {len(page_barcodes)} barcode(s)")
-                
-                # Display extracted barcodes
-                for i, bc in enumerate(page_barcodes[:3], 1):
-                    bc_type = bc.get('type', 'Unknown')
-                    bc_data = bc.get('data', '')
-                    print(f"[BARCODE EXTRACTION]      [{i}] {bc_type}: {bc_data}")
-                
-                if len(page_barcodes) > 3:
-                    print(f"[BARCODE EXTRACTION]      ... and {len(page_barcodes) - 3} more on this page")
-                
-                # Add page info to each barcode and collect
-                for barcode in page_barcodes:
-                    barcode['page'] = page_idx
-                    all_barcodes.append(barcode)
-                
-                total_pages_processed += 1
-                
-            except json.JSONDecodeError as e:
-                print(f"[BARCODE EXTRACTION]   ⚠️ Page {page_idx}: JSON parse error: {e}")
-                print(f"[BARCODE EXTRACTION]   Raw response: {response_text[:200]}...")
-            except Exception as e:
-                print(f"[BARCODE EXTRACTION]   ⚠️ Page {page_idx}: Error: {e}")
-                import traceback
-                traceback.print_exc()
-        
-        # Generate summary
-        print(f"\n[BARCODE EXTRACTION] ✅ Complete Summary:")
-        print(f"[BARCODE EXTRACTION]   Total Pages Processed: {total_pages_processed}")
-        print(f"[BARCODE EXTRACTION]   Total Barcodes Found: {len(all_barcodes)}")
-        
-        if is_pdf and len(images_to_process) > 0:
-            avg_per_page = len(all_barcodes) / len(images_to_process)
-            print(f"[BARCODE EXTRACTION]   Average per page: {avg_per_page:.1f}")
-        
-        # Group by barcode type
+            print(f"[BARCODE EXTRACTION] ✅ Page {page_idx}: {len(page_barcodes)} barcodes extracted")
+            all_barcodes.extend(page_barcodes)
+            total_pages_processed += 1
+
+        # Final dedup across all pages
+        all_barcodes = deduplicate_barcodes(all_barcodes)
+
+        # Summary
+        print(f"\n[BARCODE EXTRACTION] ✅ FINAL SUMMARY")
+        print(f"[BARCODE EXTRACTION]   Pages Processed : {total_pages_processed}")
+        print(f"[BARCODE EXTRACTION]   Total Barcodes  : {len(all_barcodes)}")
+
         type_summary = {}
         for bc in all_barcodes:
-            bc_type = bc.get('type', 'Unknown')
-            type_summary[bc_type] = type_summary.get(bc_type, 0) + 1
-        
-        if type_summary:
-            print(f"[BARCODE EXTRACTION]   By type:")
-            for bc_type, count in sorted(type_summary.items()):
-                print(f"[BARCODE EXTRACTION]      {bc_type}: {count}")
-        
-        # Get primary barcode for backwards compatibility
+            t = bc.get('type', 'Unknown')
+            type_summary[t] = type_summary.get(t, 0) + 1
+        for t, c in sorted(type_summary.items()):
+            print(f"[BARCODE EXTRACTION]     {t}: {c}")
+
         primary = all_barcodes[0] if all_barcodes else {}
-        
-        # Calculate token usage
-        input_tokens = 350 * total_pages_processed
+
+        input_tokens  = 350 * total_pages_processed * 6   # 6 tiles per page
         output_tokens = 150 + (len(all_barcodes) * 25)
-        total_tokens = input_tokens + output_tokens
-        
+
         return {
             "success": True,
             "filename": filename,
             "is_multipage": is_pdf,
             "total_pages_processed": total_pages_processed,
-            "barcode_type": primary.get('type'),  # Primary barcode (for compatibility)
-            "barcode_data": primary.get('data'),  # Primary barcode (for compatibility)
+            "barcode_type": primary.get('type'),
+            "barcode_data": primary.get('data'),
             "total_barcodes_found": len(all_barcodes),
-            "all_barcodes": all_barcodes,  # ✅ ALL barcodes with page information
-            "barcode_types_summary": type_summary,  # Summary by type
+            "all_barcodes": all_barcodes,
+            "barcode_types_summary": type_summary,
             "confidence": "high",
-            "method": "gemini_vision",
+            "method": "gemini_vision_tiled",
             "token_usage": {
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
-                "total_tokens": total_tokens
-            }
+                "total_tokens": input_tokens + output_tokens,
+            },
         }
-        
+
     except Exception as e:
         print(f"[BARCODE EXTRACTION] ✗ Error: {e}")
-        import traceback
-        traceback.print_exc()
-        
-        return {
-            "success": False,
-            "error": str(e),
-            "filename": filename
-        }
+        import traceback; traceback.print_exc()
+        return {"success": False, "error": str(e), "filename": filename}

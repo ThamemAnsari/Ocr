@@ -1126,41 +1126,47 @@ def fetch_specific_records_by_ids(app_link_name: str, report_link_name: str, rec
 
 
 def check_active_jobs_for_records(record_ids: List[str]) -> Optional[str]:
-    """Check if records are currently being processed"""
     if not supabase or not record_ids:
         return None
-    
+
     try:
-        response = supabase.table("auto_extraction_jobs")\
-            .select("job_id, status")\
-            .in_("status", ["pending", "running"])\
+        response = supabase.table("auto_extraction_jobs") \
+            .select("job_id, status") \
+            .in_("status", ["pending", "running"]) \
             .execute()
-        
+
         if not response.data:
             return None
-        
+
         for job in response.data:
             job_id = job["job_id"]
-            
-            results = supabase.table("auto_extraction_results")\
-                .select("record_id")\
-                .eq("job_id", job_id)\
-                .execute()
-            
-            if results.data:
-                active_record_ids = {str(r["record_id"]) for r in results.data}
-                overlap = set(record_ids) & active_record_ids
-                
-                if overlap:
-                    print(f"[DUPLICATE] Found {len(overlap)} records in job {job_id}")
-                    return job_id
-        
+
+            # ✅ FIX: paginate the results sub-query
+            active_record_ids = set()
+            from_idx = 0
+            PAGE = 1000
+            while True:
+                results = supabase.table("auto_extraction_results") \
+                    .select("record_id") \
+                    .eq("job_id", job_id) \
+                    .range(from_idx, from_idx + PAGE - 1) \
+                    .execute()
+                batch = results.data or []
+                active_record_ids.update(str(r["record_id"]) for r in batch)
+                if len(batch) < PAGE:
+                    break
+                from_idx += PAGE
+
+            overlap = set(record_ids) & active_record_ids
+            if overlap:
+                print(f"[DUPLICATE] Found {len(overlap)} records in job {job_id}")
+                return job_id
+
         return None
-        
+
     except Exception as e:
         print(f"[DUPLICATE CHECK] Error: {e}")
         return None
-
 # ============================================================
 # HELPER FUNCTIONS (from simple_api.py)
 # ============================================================
@@ -1455,6 +1461,7 @@ def process_extraction_job(job_id: str, config: Dict):
     Background job processor with flexible field extraction
     ✅ Extracts scholar_id/tracking_id if available
     ✅ Falls back to email/record_id if needed
+    ✅ Supports multi-bill PDFs (one PDF → bill1, bill2, bill3…)
     """
     if not supabase:
         print("[AUTO EXTRACT] ✗ Supabase not configured")
@@ -1464,15 +1471,15 @@ def process_extraction_job(job_id: str, config: Dict):
         print(f"\n{'='*80}")
         print(f"[AUTO EXTRACT] Starting Job: {job_id}")
         print(f"{'='*80}\n")
-        
+
         update_job_status(job_id, {
             "status": "running",
             "started_at": datetime.now().isoformat()
         })
-        
-        # Fetch records
+
+        # ── Fetch records ─────────────────────────────────────────────
         selected_ids = config.get('selected_record_ids', [])
-        
+
         if selected_ids:
             records = fetch_specific_records_by_ids(
                 app_link_name=config['app_link_name'],
@@ -1485,22 +1492,23 @@ def process_extraction_job(job_id: str, config: Dict):
                 report_link_name=config['report_link_name'],
                 criteria=config.get('filter_criteria')
             )
-        
+
         print(f"[AUTO EXTRACT] Processing {len(records)} records...")
         update_job_status(job_id, {"total_records": len(records)})
-        
+
         if not records:
             update_job_status(job_id, {
                 "status": "completed",
                 "completed_at": datetime.now().isoformat()
             })
             return
-        
+
         total_cost = 0.0
         processed = 0
         successful = 0
         failed = 0
-        
+
+        # ── Helpers ───────────────────────────────────────────────────
         def extract_student_name(record):
             """Extract student name from various possible fields"""
             for field in ["Name", "Student_Name", "Scholar_Name"]:
@@ -1519,172 +1527,209 @@ def process_extraction_job(job_id: str, config: Dict):
                     if parts:
                         return " ".join(parts)
             return "Unknown"
-        
+
         def extract_field_value(record, field_names):
             """
-            Extract field value, trying multiple possible field names
+            Extract field value, trying multiple possible field names.
             Returns (value, was_found)
             """
             for field_name in field_names:
                 field_value = record.get(field_name)
-                
                 if not field_value:
                     continue
-                
                 if isinstance(field_value, str):
-                    return field_value.strip() if field_value.strip() else None, True
-                
+                    return (field_value.strip() if field_value.strip() else None), True
                 if isinstance(field_value, dict):
                     display_value = field_value.get("zc_display_value")
                     if display_value:
                         return display_value.strip(), True
-                    
                     id_value = field_value.get("ID")
                     if id_value:
                         return str(id_value), True
-            
             return None, False
-        
-        # ✅ Try to detect which fields are available
+
+        # ── Detect available fields from first record ─────────────────
         first_record = records[0] if records else {}
         first_keys = set(first_record.keys())
-        
-        has_scholar_id = any(k in first_keys for k in ["Actual_Scholar_ID", "Scholar_ID", "ScholarID"])
+
+        has_scholar_id  = any(k in first_keys for k in ["Actual_Scholar_ID", "Scholar_ID", "ScholarID"])
         has_tracking_id = any(k in first_keys for k in ["Tracking_ID", "Tracking_Id", "TrackingID"])
-        has_email = any(k in first_keys for k in ["Email", "email", "student_email"])
-        
+        has_email       = any(k in first_keys for k in ["Email", "email", "student_email"])
+
         print(f"[AUTO EXTRACT] Field detection:")
-        print(f"  Scholar ID: {has_scholar_id}")
+        print(f"  Scholar ID:  {has_scholar_id}")
         print(f"  Tracking ID: {has_tracking_id}")
-        print(f"  Email: {has_email}\n")
-        
-        # Process records
+        print(f"  Email:       {has_email}\n")
+
+        # ── Record loop ───────────────────────────────────────────────
         for idx, record in enumerate(records, 1):
             record_start = time.time()
-            
-            record_id = str(record.get("ID"))
+
+            record_id    = str(record.get("ID"))
             student_name = extract_student_name(record)
-            
-            # ✅ Extract optional fields flexibly
-            scholar_id = None
+
+            scholar_id  = None
             tracking_id = None
-            email = None
-            
+            email       = None
+
             if has_scholar_id:
                 scholar_id, _ = extract_field_value(
-                    record, 
-                    ["Actual_Scholar_ID", "Scholar_ID", "ScholarID"]
+                    record, ["Actual_Scholar_ID", "Scholar_ID", "ScholarID"]
                 )
-            
             if has_tracking_id:
                 tracking_id, _ = extract_field_value(
-                    record, 
-                    ["Tracking_ID", "Tracking_Id", "TrackingID"]
+                    record, ["Tracking_ID", "Tracking_Id", "TrackingID"]
                 )
-            
             if has_email:
                 email, _ = extract_field_value(
-                    record, 
-                    ["Email", "email", "student_email"]
+                    record, ["Email", "email", "student_email"]
                 )
-            
+
             print(f"\n[AUTO EXTRACT] [{idx}/{len(records)}] {student_name} (ID: {record_id})")
-            
             if scholar_id:
                 print(f"[AUTO EXTRACT]   📋 Scholar ID: {scholar_id}")
             if tracking_id:
                 print(f"[AUTO EXTRACT]   📋 Tracking ID: {tracking_id}")
             if email:
                 print(f"[AUTO EXTRACT]   📧 Email: {email}")
-            
+
             bank_image_url_supabase = None
-            bill_images_supabase = []
-            bank_data = None
-            bill_data_array = []
-            record_tokens = 0
-            record_cost = 0.0
-            error_msg = None
+            bill_images_supabase    = []
+            bank_data               = None
+            bill_data_array         = []
+            record_tokens           = 0
+            record_cost             = 0.0
+            error_msg               = None
 
             try:
-                # Process Bank Image
+                # ── Process Bank Image ────────────────────────────────
                 if config.get('bank_field_name'):
                     bank_field_value = record.get(config['bank_field_name'])
-                    bank_zoho_urls = extract_all_image_urls(bank_field_value, max_images=1)
-                    
+                    bank_zoho_urls   = extract_all_image_urls(bank_field_value, max_images=1)
+
                     if bank_zoho_urls:
                         try:
                             print(f"[AUTO EXTRACT]   📥 Downloading bank image...")
                             file_content, filename = download_file_from_url(bank_zoho_urls[0])
-                            
+
                             print(f"[AUTO EXTRACT]   🤖 Processing with Gemini...")
                             result = process_single_file(file_content, filename, "bank")
-                            
+
                             if result.get('success'):
                                 bank_data = result
                                 tokens = result.get('token_usage', {})
                                 record_tokens += tokens.get('total_tokens', 0)
-                                record_cost += calculate_cost(
+                                record_cost   += calculate_cost(
                                     tokens.get('input_tokens', 0),
                                     tokens.get('output_tokens', 0),
                                     'gemini_vision'
                                 )
-                                
-                                # Skip Supabase storage upload (bucket issue)
-                                # if supabase:
-                                #     bank_image_url_supabase = upload_to_supabase_storage(...)
-                                
                                 print(f"[AUTO EXTRACT]   ✅ Bank extracted")
                             else:
                                 error_msg = f"Bank OCR failed: {result.get('error')}"
                                 print(f"[AUTO EXTRACT]   ✗ {error_msg}")
+
                         except Exception as e:
                             error_msg = f"Bank processing error: {str(e)}"
                             print(f"[AUTO EXTRACT]   ✗ {error_msg}")
-                
-                # Process Bill Images (multiple)
+
+                # ── Process Bill Images (supports multi-bill PDFs) ────
                 if config.get('bill_field_name'):
                     bill_field_value = record.get(config['bill_field_name'])
-                    bill_zoho_urls = extract_all_image_urls(bill_field_value, max_images=5)
-                    
+                    bill_zoho_urls   = extract_all_image_urls(bill_field_value, max_images=5)
+
                     if bill_zoho_urls:
-                        print(f"[AUTO EXTRACT]   📥 Found {len(bill_zoho_urls)} bill images")
-                        
-                        for bill_idx, bill_zoho_url in enumerate(bill_zoho_urls, 1):
+                        print(f"[AUTO EXTRACT]   📥 Found {len(bill_zoho_urls)} bill file(s) in field")
+
+                        for file_idx, bill_zoho_url in enumerate(bill_zoho_urls, 1):
                             try:
-                                print(f"[AUTO EXTRACT]   📥 Downloading bill {bill_idx}...")
+                                print(f"[AUTO EXTRACT]   📥 Downloading bill file {file_idx}...")
                                 file_content, filename = download_file_from_url(bill_zoho_url)
-                                
-                                print(f"[AUTO EXTRACT]   🤖 Processing bill {bill_idx}...")
-                                result = process_single_file(file_content, filename, "bill")
-                                
-                                if result.get('success'):
-                                    bill_data_array.append(result)
-                                    tokens = result.get('token_usage', {})
-                                    record_tokens += tokens.get('total_tokens', 0)
-                                    record_cost += calculate_cost(
-                                        tokens.get('input_tokens', 0),
-                                        tokens.get('output_tokens', 0),
-                                        'gemini_vision'
-                                    )
-                                    
-                                    # Skip Supabase storage upload
-                                    # if supabase:
-                                    #     bill_image_url = upload_to_supabase_storage(...)
-                                    #     bill_images_supabase.append(bill_image_url)
-                                    
-                                    print(f"[AUTO EXTRACT]   ✅ Bill {bill_idx} extracted")
+
+                                # ── Is it a PDF? ──────────────────────
+                                is_pdf = (
+                                    file_content[:4] == b'%PDF'
+                                    or file_content[:5] == b'\x0a%PDF'
+                                )
+
+                                if is_pdf:
+                                    # Multi-page PDF → potentially multiple bills
+                                    print(f"[AUTO EXTRACT]   📄 PDF detected for file {file_idx} "
+                                          f"– running multi-page bill extraction")
+
+                                    from ai_analyzer import analyze_bill_multi_page
+
+                                    try:
+                                        page_bills = analyze_bill_multi_page(file_content, filename)
+                                    except Exception as mp_err:
+                                        print(f"[AUTO EXTRACT]   ✗ Multi-page extraction failed: {mp_err}")
+                                        if not error_msg:
+                                            error_msg = f"Bill file {file_idx}: multi-page extraction failed"
+                                        page_bills = []
+
+                                    for bill_result in page_bills:
+                                        # Wrap to match the shape process_single_file returns
+                                        wrapped = {
+                                            **bill_result,
+                                            "success": True,
+                                            "method": "gemini_vision",
+                                            "filename": filename,
+                                            "token_usage": {
+                                                "input_tokens": 258,
+                                                "output_tokens": 80,
+                                                "total_tokens": 338,
+                                            },
+                                        }
+                                        bill_data_array.append(wrapped)
+                                        record_tokens += 338
+                                        record_cost   += calculate_cost(258, 80, "gemini_vision")
+
+                                    if page_bills:
+                                        print(f"[AUTO EXTRACT]   ✅ File {file_idx}: "
+                                              f"{len(page_bills)} bill(s) extracted from PDF")
+                                    else:
+                                        print(f"[AUTO EXTRACT]   ⚠️ File {file_idx}: "
+                                              f"No bills extracted from PDF")
+                                        if not error_msg:
+                                            error_msg = f"Bill file {file_idx}: no bills found in PDF"
+
                                 else:
-                                    error_detail = result.get('error')
-                                    print(f"[AUTO EXTRACT]   ✗ Bill {bill_idx} failed: {error_detail}")
-                                    if not error_msg:
-                                        error_msg = f"Bill {bill_idx} OCR failed"
-                                    
+                                    # Single image → one bill
+                                    print(f"[AUTO EXTRACT]   🤖 Processing bill file {file_idx} (image)...")
+                                    result = process_single_file(file_content, filename, "bill")
+
+                                    if result.get('success'):
+                                        bill_data_array.append(result)
+                                        tokens = result.get('token_usage', {})
+                                        record_tokens += tokens.get('total_tokens', 0)
+                                        record_cost   += calculate_cost(
+                                            tokens.get('input_tokens', 0),
+                                            tokens.get('output_tokens', 0),
+                                            'gemini_vision'
+                                        )
+                                        print(f"[AUTO EXTRACT]   ✅ Bill file {file_idx} extracted "
+                                              f"(Amount: ₹{result.get('amount')})")
+                                    else:
+                                        err_detail = result.get('error')
+                                        print(f"[AUTO EXTRACT]   ✗ Bill file {file_idx} failed: {err_detail}")
+                                        if not error_msg:
+                                            error_msg = f"Bill file {file_idx} OCR failed"
+
                             except Exception as e:
-                                print(f"[AUTO EXTRACT]   ✗ Bill {bill_idx} error: {str(e)}")
+                                print(f"[AUTO EXTRACT]   ✗ Bill file {file_idx} error: {str(e)}")
                                 if not error_msg:
-                                    error_msg = f"Bill {bill_idx} processing error"
-                
-                # Determine status
+                                    error_msg = f"Bill file {file_idx} processing error"
+
+                        # Summary log
+                        print(f"[AUTO EXTRACT]   📊 Total bills extracted for this record: "
+                              f"{len(bill_data_array)}")
+                        for i, b in enumerate(bill_data_array, 1):
+                            print(f"[AUTO EXTRACT]      Bill {i}: "
+                                  f"Page={b.get('page_number', '?')} | "
+                                  f"Amount=₹{b.get('amount')} | "
+                                  f"College={b.get('college_name')}")
+
+                # ── Determine record status ───────────────────────────
                 if bank_data or bill_data_array:
                     status = "success"
                     successful += 1
@@ -1693,16 +1738,16 @@ def process_extraction_job(job_id: str, config: Dict):
                     failed += 1
                     if not error_msg:
                         error_msg = "No images found or OCR failed"
-                
+
             except Exception as record_error:
-                status = "failed"
-                failed += 1
+                status    = "failed"
+                failed   += 1
                 error_msg = f"Record error: {str(record_error)}"
                 print(f"[AUTO EXTRACT]   ✗ {error_msg}")
-            
+
             processing_time = int((time.time() - record_start) * 1000)
-            
-            # ✅ Save result with flexible fields
+
+            # ── Save result ───────────────────────────────────────────
             if supabase:
                 try:
                     save_extraction_result(
@@ -1726,45 +1771,43 @@ def process_extraction_job(job_id: str, config: Dict):
                     )
                 except Exception as save_error:
                     print(f"[AUTO EXTRACT]   ✗ Save failed: {save_error}")
-            
+
             total_cost += record_cost
-            processed += 1
-            
-            # Update progress
+            processed  += 1
+
             update_job_status(job_id, {
-                "processed_records": processed,
+                "processed_records":  processed,
                 "successful_records": successful,
-                "failed_records": failed,
-                "total_cost_usd": round(total_cost, 6)
+                "failed_records":     failed,
+                "total_cost_usd":     round(total_cost, 6)
             })
-            
+
             print(f"[AUTO EXTRACT]   💰 ${record_cost:.6f} | ⏱️ {processing_time}ms | {status}")
             time.sleep(0.3)
-        
-        # Job completed
+
+        # ── Job completed ─────────────────────────────────────────────
         update_job_status(job_id, {
-            "status": "completed",
-            "completed_at": datetime.now().isoformat(),
+            "status":        "completed",
+            "completed_at":  datetime.now().isoformat(),
             "total_cost_usd": round(total_cost, 6)
         })
-        
+
         print(f"\n{'='*80}")
         print(f"[AUTO EXTRACT] ✅ Completed: {job_id}")
         print(f"[AUTO EXTRACT]   Success: {successful}/{len(records)}")
-        print(f"[AUTO EXTRACT]   Failed: {failed}/{len(records)}")
-        print(f"[AUTO EXTRACT]   Cost: ${total_cost:.6f}")
+        print(f"[AUTO EXTRACT]   Failed:  {failed}/{len(records)}")
+        print(f"[AUTO EXTRACT]   Cost:    ${total_cost:.6f}")
         print(f"{'='*80}\n")
-        
+
     except Exception as e:
         print(f"[AUTO EXTRACT] ✗ Job failed: {e}")
         import traceback
         traceback.print_exc()
-        
+
         update_job_status(job_id, {
-            "status": "failed",
+            "status":       "failed",
             "completed_at": datetime.now().isoformat()
         })
-
 # ============================================================
 # UPDATED ENDPOINTS (No Team ID needed!)
 # ============================================================
@@ -2975,6 +3018,9 @@ def process_cross_report_background(config: Dict):
             "Bill3_Amount": bill_data_list[2].get('amount', 0) if len(bill_data_list) > 2 else 0,
             "Bill4_Amount": bill_data_list[3].get('amount', 0) if len(bill_data_list) > 3 else 0,
             "Bill5_Amount": bill_data_list[4].get('amount', 0) if len(bill_data_list) > 4 else 0,
+            "Bill6_Amount": bill_data_list[5].get('amount', 0) if len(bill_data_list) > 5 else 0,
+            "Bill7_Amount": bill_data_list[6].get('amount', 0) if len(bill_data_list) > 6 else 0,
+            "Bill8_Amount": bill_data_list[7].get('amount', 0) if len(bill_data_list) > 7 else 0,
             "Amount": total_amount,
             "status": "OCR Completed"
         }
@@ -3041,8 +3087,11 @@ def format_record_for_zoho_creator(record: Dict) -> Dict:
     bill3_amount = safe_float(bill_data_array[2].get('amount')) if len(bill_data_array) > 2 else 0.0
     bill4_amount = safe_float(bill_data_array[3].get('amount')) if len(bill_data_array) > 3 else 0.0
     bill5_amount = safe_float(bill_data_array[4].get('amount')) if len(bill_data_array) > 4 else 0.0
+    bill6_amount = safe_float(bill_data_array[5].get('amount')) if len(bill_data_array) > 5 else 0.0
+    bill7_amount = safe_float(bill_data_array[6].get('amount')) if len(bill_data_array) > 6 else 0.0
+    bill8_amount = safe_float(bill_data_array[7].get('amount')) if len(bill_data_array) > 7 else 0.0
     
-    total_amount = bill1_amount + bill2_amount + bill3_amount + bill4_amount + bill5_amount
+    total_amount = bill1_amount + bill2_amount + bill3_amount + bill4_amount + bill5_amount + bill6_amount + bill7_amount + bill8_amount
     
     # Get scholar info
     scholar_name = (
@@ -3111,6 +3160,9 @@ def format_record_for_zoho_creator(record: Dict) -> Dict:
         "Bill3_Amount": bill3_amount,
         "Bill4_Amount": bill4_amount,
         "Bill5_Amount": bill5_amount,
+        "Bill6_Amount": bill6_amount,
+        "Bill7_Amount": bill7_amount,
+        "Bill8_Amount": bill8_amount,
         "Total_Amount": total_amount,
         "Status": status,
         "Tokens_Used": record.get('tokens_used', 0),
@@ -4440,270 +4492,123 @@ async def fetch_report_fields(
 # ============================================================
 
 
+
+
 def get_already_extracted_record_ids(
-    app_link_name: str, 
+    app_link_name: str,
     report_link_name: str,
     include_failed: bool = False,
     include_synced: bool = False
 ) -> set:
-    """
-    Get IDs of already extracted AND synced records
-    
-    Args:
-        app_link_name: Zoho app name
-        report_link_name: Zoho report name
-        include_failed: If True, also exclude failed attempts (default: False, only exclude successful)
-        include_synced: If True, include synced records in available pool (default: False, exclude synced)
-    
-    Returns:
-        Set of record_id strings that should be excluded from processing
-    
-    ✅ Excludes:
-        - Successfully extracted records
-        - Records already synced to Creator
-        - (Optionally) Failed extraction attempts
-    """
     if not supabase:
         return set()
-    
+
     try:
         print(f"\n[FILTER] Checking for already-extracted records...")
         print(f"[FILTER] App: {app_link_name} | Report: {report_link_name}")
-        
-        # Query: Get all records for this app/report combination
-        # ✅ ADDED: push_status to detect synced records
-        response = supabase.table("auto_extraction_results")\
-            .select("id, record_id, status, push_status, scholar_id, tracking_id, created_at")\
-            .eq("app_link_name", app_link_name)\
-            .eq("report_link_name", report_link_name)\
-            .execute()
-        
-        if not response.data:
-            print(f"[FILTER] ✅ No previous extractions found - all records are new")
+
+        # ✅ FIX: Paginate Supabase — default limit is 1000 rows per request
+        all_results = []
+        PAGE_SIZE  = 1000
+        from_index = 0
+
+        while True:
+            response = supabase.table("auto_extraction_results") \
+                .select("id, record_id, status, push_status, scholar_id, tracking_id, created_at") \
+                .eq("app_link_name", app_link_name) \
+                .eq("report_link_name", report_link_name) \
+                .range(from_index, from_index + PAGE_SIZE - 1) \
+                .execute()
+
+            batch = response.data or []
+            all_results.extend(batch)
+
+            print(f"[FILTER]   Page {from_index // PAGE_SIZE + 1}: "
+                  f"fetched {len(batch)} rows (running total: {len(all_results)})")
+
+            if len(batch) < PAGE_SIZE:
+                break          # last page reached
+            from_index += PAGE_SIZE
+
+        if not all_results:
+            print(f"[FILTER] ✅ No previous extractions found — all records are new")
             return set()
-        
-        all_results = response.data
+
         print(f"[FILTER] Found {len(all_results)} total historical records")
-        
-        # Count by status and push_status
-        status_counts = {}
+
+        # ── count by status & push_status ──────────────────────────
+        status_counts     = {}
         push_status_counts = {}
-        
         for r in all_results:
-            status = r.get("status", "unknown")
-            status_counts[status] = status_counts.get(status, 0) + 1
-            
-            push_status = r.get("push_status", "not_synced")
-            push_status_counts[push_status] = push_status_counts.get(push_status, 0) + 1
-        
+            s  = r.get("status",      "unknown")
+            ps = r.get("push_status", "not_synced")
+            status_counts[s]      = status_counts.get(s, 0) + 1
+            push_status_counts[ps] = push_status_counts.get(ps, 0) + 1
+
         print(f"[FILTER] Status breakdown:")
-        for status, count in sorted(status_counts.items()):
-            print(f"[FILTER]   Extraction Status - {status}: {count}")
-        
+        for s, c in sorted(status_counts.items()):
+            print(f"[FILTER]   Extraction Status - {s}: {c}")
+
         print(f"[FILTER] Sync Status breakdown:")
-        for push_status, count in sorted(push_status_counts.items()):
-            print(f"[FILTER]   Sync Status - {push_status}: {count}")
-        
-        # Extract record IDs based on filters
+        for ps, c in sorted(push_status_counts.items()):
+            print(f"[FILTER]   Sync Status - {ps}: {c}")
+
+        # ── build exclusion set ─────────────────────────────────────
         already_extracted = set()
-        
-        # ========================================
-        # 1️⃣ ALWAYS exclude successful extractions
-        # ========================================
-        successful_results = [r for r in all_results if r.get("status") == "success"]
-        successful_ids = {str(r["record_id"]) for r in successful_results if r.get("record_id")}
+
+        # 1️⃣  Always exclude successful extractions
+        successful_ids = {
+            str(r["record_id"])
+            for r in all_results
+            if r.get("status") == "success" and r.get("record_id")
+        }
         already_extracted.update(successful_ids)
-        
         print(f"[FILTER] ✅ Excluding {len(successful_ids)} successful extractions")
-        
-        # ========================================
-        # 2️⃣ ALWAYS exclude synced records (unless overridden)
-        # ========================================
+
+        # 2️⃣  Always exclude synced records (unless caller opts in for re-sync)
         if not include_synced:
-            synced_results = [r for r in all_results if r.get("push_status") == "synced"]
-            synced_ids = {str(r["record_id"]) for r in synced_results if r.get("record_id")}
+            synced_ids = {
+                str(r["record_id"])
+                for r in all_results
+                if r.get("push_status") == "synced" and r.get("record_id")
+            }
             already_extracted.update(synced_ids)
-            
             print(f"[FILTER] ✅ Excluding {len(synced_ids)} already synced to Zoho Creator")
-            
-            if synced_ids:
-                sample_synced = list(synced_ids)[:3]
-                print(f"[FILTER]    Sample synced IDs: {sample_synced}")
         else:
             print(f"[FILTER] ⚠️ Including {push_status_counts.get('synced', 0)} synced records for re-sync")
-        
-        # ========================================
-        # 3️⃣ OPTIONALLY exclude failed attempts
-        # ========================================
+
+        # 3️⃣  Optionally exclude failed attempts
         if include_failed:
-            failed_results = [r for r in all_results if r.get("status") in ["failed", "error"]]
-            failed_ids = {str(r["record_id"]) for r in failed_results if r.get("record_id")}
+            failed_ids = {
+                str(r["record_id"])
+                for r in all_results
+                if r.get("status") in ("failed", "error") and r.get("record_id")
+            }
             already_extracted.update(failed_ids)
             print(f"[FILTER] ⚠️ Also excluding {len(failed_ids)} failed extraction attempts")
-            
-            if failed_ids:
-                sample_failed = list(failed_ids)[:3]
-                print(f"[FILTER]    Sample failed IDs: {sample_failed}")
         else:
             failed_count = status_counts.get("failed", 0) + status_counts.get("error", 0)
             print(f"[FILTER] 💡 Including {failed_count} failed records for retry")
-        
-        # ========================================
-        # Diagnostic Summary
-        # ========================================
+
+        # ── summary ────────────────────────────────────────────────
+        available = len(all_results) - len(already_extracted)
         print(f"\n[FILTER] 📊 EXCLUSION SUMMARY")
         print(f"[FILTER] {'='*60}")
         print(f"[FILTER] Total extracted (Supabase):  {len(all_results)}")
         print(f"[FILTER] - Successful:                {len(successful_ids)}")
         print(f"[FILTER] - Synced to Creator:         {push_status_counts.get('synced', 0)}")
         print(f"[FILTER] - Failed:                    {status_counts.get('failed', 0)}")
-        print(f"[FILTER] - Other:                     {len(all_results) - len(successful_ids) - push_status_counts.get('synced', 0) - status_counts.get('failed', 0)}")
         print(f"[FILTER] {'='*60}")
         print(f"[FILTER] Total to EXCLUDE:            {len(already_extracted)}")
-        print(f"[FILTER] Available for processing:    {1745 - len(already_extracted)}")
+        print(f"[FILTER] Available for processing:    {available}")
         print(f"[FILTER] {'='*60}\n")
-        
+
         return already_extracted
-        
+
     except Exception as e:
         print(f"[FILTER] ✗ Error: {e}")
-        import traceback
-        traceback.print_exc()
+        import traceback; traceback.print_exc()
         return set()
-
-
-
-def get_already_extracted_record_ids(
-    app_link_name: str, 
-    report_link_name: str,
-    include_failed: bool = False,
-    include_synced: bool = False
-) -> set:
-    """
-    Get IDs of already extracted AND synced records
-    
-    Args:
-        app_link_name: Zoho app name
-        report_link_name: Zoho report name
-        include_failed: If True, also exclude failed attempts (default: False, only exclude successful)
-        include_synced: If True, include synced records in available pool (default: False, exclude synced)
-    
-    Returns:
-        Set of record_id strings that should be excluded from processing
-    
-    ✅ Excludes:
-        - Successfully extracted records
-        - Records already synced to Creator
-        - (Optionally) Failed extraction attempts
-    """
-    if not supabase:
-        return set()
-    
-    try:
-        print(f"\n[FILTER] Checking for already-extracted records...")
-        print(f"[FILTER] App: {app_link_name} | Report: {report_link_name}")
-        
-        # Query: Get all records for this app/report combination
-        # ✅ ADDED: push_status to detect synced records
-        response = supabase.table("auto_extraction_results")\
-            .select("id, record_id, status, push_status, scholar_id, tracking_id, created_at")\
-            .eq("app_link_name", app_link_name)\
-            .eq("report_link_name", report_link_name)\
-            .execute()
-        
-        if not response.data:
-            print(f"[FILTER] ✅ No previous extractions found - all records are new")
-            return set()
-        
-        all_results = response.data
-        print(f"[FILTER] Found {len(all_results)} total historical records")
-        
-        # Count by status and push_status
-        status_counts = {}
-        push_status_counts = {}
-        
-        for r in all_results:
-            status = r.get("status", "unknown")
-            status_counts[status] = status_counts.get(status, 0) + 1
-            
-            push_status = r.get("push_status", "not_synced")
-            push_status_counts[push_status] = push_status_counts.get(push_status, 0) + 1
-        
-        print(f"[FILTER] Status breakdown:")
-        for status, count in sorted(status_counts.items()):
-            print(f"[FILTER]   Extraction Status - {status}: {count}")
-        
-        print(f"[FILTER] Sync Status breakdown:")
-        for push_status, count in sorted(push_status_counts.items()):
-            print(f"[FILTER]   Sync Status - {push_status}: {count}")
-        
-        # Extract record IDs based on filters
-        already_extracted = set()
-        
-        # ========================================
-        # 1️⃣ ALWAYS exclude successful extractions
-        # ========================================
-        successful_results = [r for r in all_results if r.get("status") == "success"]
-        successful_ids = {str(r["record_id"]) for r in successful_results if r.get("record_id")}
-        already_extracted.update(successful_ids)
-        
-        print(f"[FILTER] ✅ Excluding {len(successful_ids)} successful extractions")
-        
-        # ========================================
-        # 2️⃣ ALWAYS exclude synced records (unless overridden)
-        # ========================================
-        if not include_synced:
-            synced_results = [r for r in all_results if r.get("push_status") == "synced"]
-            synced_ids = {str(r["record_id"]) for r in synced_results if r.get("record_id")}
-            already_extracted.update(synced_ids)
-            
-            print(f"[FILTER] ✅ Excluding {len(synced_ids)} already synced to Zoho Creator")
-            
-            if synced_ids:
-                sample_synced = list(synced_ids)[:3]
-                print(f"[FILTER]    Sample synced IDs: {sample_synced}")
-        else:
-            print(f"[FILTER] ⚠️ Including {push_status_counts.get('synced', 0)} synced records for re-sync")
-        
-        # ========================================
-        # 3️⃣ OPTIONALLY exclude failed attempts
-        # ========================================
-        if include_failed:
-            failed_results = [r for r in all_results if r.get("status") in ["failed", "error"]]
-            failed_ids = {str(r["record_id"]) for r in failed_results if r.get("record_id")}
-            already_extracted.update(failed_ids)
-            print(f"[FILTER] ⚠️ Also excluding {len(failed_ids)} failed extraction attempts")
-            
-            if failed_ids:
-                sample_failed = list(failed_ids)[:3]
-                print(f"[FILTER]    Sample failed IDs: {sample_failed}")
-        else:
-            failed_count = status_counts.get("failed", 0) + status_counts.get("error", 0)
-            print(f"[FILTER] 💡 Including {failed_count} failed records for retry")
-        
-        # ========================================
-        # Diagnostic Summary
-        # ========================================
-        print(f"\n[FILTER] 📊 EXCLUSION SUMMARY")
-        print(f"[FILTER] {'='*60}")
-        print(f"[FILTER] Total extracted (Supabase):  {len(all_results)}")
-        print(f"[FILTER] - Successful:                {len(successful_ids)}")
-        print(f"[FILTER] - Synced to Creator:         {push_status_counts.get('synced', 0)}")
-        print(f"[FILTER] - Failed:                    {status_counts.get('failed', 0)}")
-        print(f"[FILTER] - Other:                     {len(all_results) - len(successful_ids) - push_status_counts.get('synced', 0) - status_counts.get('failed', 0)}")
-        print(f"[FILTER] {'='*60}")
-        print(f"[FILTER] Total to EXCLUDE:            {len(already_extracted)}")
-        print(f"[FILTER] Available for processing:    {1745 - len(already_extracted)}")
-        print(f"[FILTER] {'='*60}\n")
-        
-        return already_extracted
-        
-    except Exception as e:
-        print(f"[FILTER] ✗ Error: {e}")
-        import traceback
-        traceback.print_exc()
-        return set()
-
 
 # ============================================================
 # ✅ UPDATED: fetch_zoho_records_with_dedup
@@ -5445,6 +5350,9 @@ async def get_zoho_form_fields(request: ZohoConfigRequest):
                 "Bill3_Amount",
                 "Bill4_Amount",
                 "Bill5_Amount",
+                "Bill6_Amount",
+                "Bill7_Amount",
+                "Bill8_Amount",
                 "Total_Amount",
                 "Tokens_Used",
                 "Status"
