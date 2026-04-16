@@ -22,9 +22,5 @@ supabase==2.10.0
 
 # Utilities
 requests==2.31.0
-pydantic==2.5.3
-pydantic-settings==2.1.0
-
-# Optional: Production dependencies
-# redis==5.0.1
-# psycopg2-binary==2.9.9
+pydantic==2.7.4
+pydantic-settings==2.3.4

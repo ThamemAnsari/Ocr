@@ -19,7 +19,7 @@ from PIL import Image
 # Configuration
 AUTHENTIK_URL = os.getenv("AUTHENTIK_URL", "https://authentik.teameverest.ngo")
 AUTHENTIK_API_TOKEN = os.getenv("AUTHENTIK_API_TOKEN", "KPu2Ow7RVjIZFFZ5DdXSu1LqaI5oxFBPxsnORgQHykECbiCYoReoBE5vEx2U")  # For user lookup
-FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5174")
 SECRET_KEY = os.getenv("SECRET_KEY", secrets.token_urlsafe(32))
 
 # Supabase Configuration
