@@ -8,8 +8,8 @@ import json
 from urllib.parse import urlencode
 
 # Your credentials from Zoho API Console
-CLIENT_ID = "1000.K79W0PP1ZGEUW4QV5KNHU2IHEC62XX"
-CLIENT_SECRET = "a0d0132fb75462c88c35701542cd5d2acc2091a868"
+CLIENT_ID = "1000.32N0HKOYP89WRLV4Y113G1DQ98CZ4J"
+CLIENT_SECRET = "7b47ae8d585fe187ac4df9e180e88196dbba6a753e"
 REDIRECT_URI = "https://3e7064dbd961.ngrok-free.app/oauth/callback"
 
 # Step 1: Generate authorization URL
